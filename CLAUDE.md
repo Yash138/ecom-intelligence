@@ -8,6 +8,9 @@
 | 2026-05-11 | Project, Repo Structure | Owner corrected to personal project; repo renamed `ecom-pipelines` → `ecom-intelligence` |
 | 2026-05-11 | Current State, Development Approach, Keepa API Plan, Consultant, Finalized Categories | Added Keepa limits, consultant Rishi, 14 categories, 16-weekend timeline |
 | 2026-05-11 | Maintenance Rules | Added doc convention rule — all docs require Update History + TOC |
+| 2026-05-11 | First Thing to Build, Repo Structure | Revised to reflect Phase 0 (direct scraping) as the immediate first step before any Keepa/infra work |
+| 2026-06-03 | Project Scope, New Infra Key Decisions, Credentials | Scope expanded to multi-market; DB created (`ecom_intel`); multi-market schema decision (Option A — marketplace as column) |
+| 2026-06-04 | New Infra Key Decisions | Orchestration repo renamed `ecom-orchestration` → `orchestration`; scope made generic/multi-project |
 
 ## Table of Contents
 
@@ -30,7 +33,7 @@
 ## Project
 - **Owner:** Yash (personal project)
 - **Goal:** System for product discovery, evaluation, and differentiation — supports launching products in the ecommerce market.
-- **Scope:** Amazon US only. Expansion to other Amazon markets or platforms is undecided — do not assume or plan for it.
+- **Scope:** Multi-market from the start (Amazon US initial target; Amazon IN, UK, CA and other markets planned). All DB and pipeline designs must treat `marketplace_id` as a first-class dimension.
 
 ## Maintenance Rules
 - Update this file whenever new decisions, credentials, or structural info emerge. Do not wait to be asked.
@@ -81,9 +84,11 @@ Full design: `docs/new_infra/infra_design.md` (v1.2, 2026-04-22) — source of t
 | Orchestration | Apache Airflow (LocalExecutor to start) |
 | Transforms | PySpark (raw→transformed), dbt-spark (transformed→curated) |
 | Secrets | HashiCorp Vault (self-hosted) |
-| Repos | 2 repos: `ecom-orchestration` (DAGs) + `ecom-intelligence` (scripts, Spark, dbt) |
+| Repos | 2 repos: `orchestration` (DAGs, generic/multi-project) + `ecom-intelligence` (scripts, Spark, dbt) |
+| Local DB (Phase 0) | `ecom_intel` on localhost Postgres — separate from India `ecommerce` DB |
+| Multi-market schema | Option A: `marketplace_id` column on every table; single schema set, not schema-per-market |
 
-**Do not use:** AWS S3/EC2 (egress cost), Postgres for historical data, PA-API (deprecated 2026-04-30).
+**Do not use:** AWS S3/EC2 (egress cost), Postgres for historical data, PA-API (deprecated 2026-04-30). Do not write Phase 0 data into the old `ecommerce` India DB.
 
 ## Data Providers & Truth Classes
 Full research: `docs/new_infra/Amazon-Ecom-data-providers-deep-research-report.md`
@@ -98,21 +103,30 @@ Full research: `docs/new_infra/Amazon-Ecom-data-providers-deep-research-report.m
 Jungle Scout / SellerApp = Truth Class D (estimates, store with `is_estimate=true`).
 
 ## First Thing to Build
-1. **Browse node pipeline** — fetch Amazon US category tree via Keepa → local DB. Prerequisite for everything else.
-2. **Category Opportunity Scoring Engine** — ranks 14 finalized categories' leaf nodes 0–100. Output explored via Jupyter.
-   - Scoring signals and SQL: `docs/new_infra/category_opportunity_scoring_approach.md` (written for India data — adapt review count thresholds for US: use <50 reviews as low-competition threshold, not <200)
-   - Strategy rationale: `docs/old_infra/epip_first_step_strategy.md`
+**Phase 0 (immediate — no paid APIs needed):**
+1. Adapt India Scrapy spiders for Amazon.com → scrape bestseller + new releases for 14 categories → local Postgres
+2. Run SQL scoring rubric → ranked product shortlist
+3. Manual gut check → Keepa history pull on 5 finalists only → product selection
+- Full approach: `docs/new_infra/infra_design.md` §0
+- Original strategy ideation: `docs/fast_execution_new_strategy.md`
+
+**Phase 1 (after product selected — triggers full infra build):**
+- Browse node pipeline via Keepa → category opportunity scoring
+- Scoring signals: `docs/new_infra/category_opportunity_scoring_approach.md` (India data — adapt <50 review threshold for US)
+- Strategy rationale: `docs/old_infra/epip_first_step_strategy.md`
 
 ## Credentials
-- **PostgreSQL (old India DB):** host=localhost, db=ecommerce, user=llm_readonly, password=gaC5.adu1, port=5432
-- **New infra credentials:** not yet provisioned
+- **PostgreSQL (India DB — frozen):** host=localhost, db=ecommerce, user=llm_readonly, password=gaC5.adu1, port=5432 — read-only archive, do not write
+- **PostgreSQL (ecom_intel — active):** host=localhost, db=ecom_intel, port=5432, admin user=ecom_intel_admin — full creds in `.secrets/admin_creds.env` (gitignored)
+- **Cloud infra credentials:** not yet provisioned
 
 ## Repo Structure
 - `CLAUDE.md` — this file
 - `docs/chosen_categories.md` — 14 finalized Amazon US categories
-- `docs/new_infra/infra_design.md` — **final** new infra design (Iceberg lakehouse, Hetzner/R2)
+- `docs/fast_execution_new_strategy.md` — original ideation for Phase 0 scraping strategy (superseded by infra_design.md §0)
+- `docs/new_infra/infra_design.md` — **final** new infra design; **§0 is Phase 0 (execute first)** — direct scraping for product shortlist
 - `docs/new_infra/Ecom Roadmap.xlsx` — consultant's 20-week launch roadmap
-- `docs/new_infra/design_doc_chatgpt.md` — superseded first draft, ignore
+- `docs/design_doc_chatgpt.md` — superseded first draft, ignore (moved out of new_infra/)
 - `docs/new_infra/category_opportunity_scoring_approach.md` — scoring engine design (signals, SQL, weights)
 - `docs/new_infra/Amazon-Ecom-data-providers-deep-research-report.md` — vendor API research
 - `docs/old_infra/system_flow.md` — old India pipeline architecture (Scrapy → Postgres)

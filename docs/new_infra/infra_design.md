@@ -13,9 +13,23 @@
 |---|---|---|
 | 2026-04-22 | All | v1.2 — initial design finalized |
 | 2026-05-11 | §5 Repo Structure, §6 CI/CD, §9 Data Flow, §12 Decisions Log | Renamed `ecom-pipelines` → `ecom-intelligence` throughout |
+| 2026-05-11 | §0 Phase 0 (new section) | Added fast execution strategy as mandatory first step before any infra build |
+| 2026-05-11 | §1, §2.1, §3.7, §5, §9, §12 | Full revamp — added Phase 0 to vendor onboarding table, rewrote repo structure with Phase 0 directories, updated data flow diagram and decisions log |
+| 2026-06-03 | §0.4, §12 | DB changed from `ecommerce` to `ecom_intel`; multi-market schema decision added (Option A — marketplace as column); `marketplaces` lookup table defined |
+| 2026-06-04 | §0.1–0.5, §5, §9, §12 | Phase 0 full design update: category hierarchy spider added as prerequisite; all table DDL finalized; schema layout defined (staging/transformed/monitoring/curated); HTML archiving + validation pipeline added; spider build order documented; data flow diagram updated; India spider analysis recorded |
+| 2026-06-04 | §5, §12 | Orchestration repo renamed `ecom-orchestration` → `orchestration`; scope changed to generic/multi-project with per-project folders + shared utilities; DAGs-last rule added |
+| 2026-06-04 | §0.4, §12 | Ranking data split into two layers: staging (raw append) + transformed (deduplicated via MERGE); dedup key defined as (marketplace_id, list_type, subcategory_node_id, asin, scrape_date); controller reset strategy (time-based, configurable N days) documented |
 
 ## Table of Contents
 
+- [0. Phase 0 — Fast Execution Strategy (Execute First)](#0-phase-0--fast-execution-strategy-execute-first)
+  - [0.1 Goal](#01-goal)
+  - [0.2 What to Scrape](#02-what-to-scrape)
+  - [0.3 Scraper Setup](#03-scraper-setup)
+  - [0.4 Storage](#04-storage)
+  - [0.5 Scoring Rubric (SQL)](#05-scoring-rubric-sql)
+  - [0.6 Output and Next Action](#06-output-and-next-action)
+  - [0.7 Transition Trigger to Phase 1](#07-transition-trigger-to-phase-1)
 - [1. Overview and Goals](#1-overview-and-goals)
   - [Current Scale Context](#current-scale-context)
   - [Non-goals (explicit)](#non-goals-explicit)
@@ -52,7 +66,333 @@
 
 ---
 
+## 0. Phase 0 — Fast Execution Strategy (Execute First)
+
+**Execute this entire phase before subscribing to Keepa, provisioning any cloud infra, or building any pipeline from this document.**
+
+The rest of this document describes a monitoring and trend platform — it answers "which categories are growing over time." Phase 0 answers "which specific products can I launch in 90 days" using only a current snapshot. These are sequential: Phase 0 produces the product shortlist; the full platform is built to monitor and validate that shortlist and support ongoing decisions after launch.
+
+### 0.1 Goal
+
+Get a ranked shortlist of 10–15 product candidates across the 10 categories in `docs/chosen_categories.csv` within one weekend, using zero paid infrastructure. Source: Amazon.com bestseller and new releases pages scraped directly. Storage: local Postgres (`ecom_intel`). Analysis: SQL scoring query.
+
+### 0.2 What to Scrape
+
+**Spider build order — must follow this sequence:**
+
+```
+1. AmzCategoryHierarchy  →  transformed.amz_category + transformed.amz_category_hierarchy
+                                        ↓
+2. Seeder SQL            →  transformed.amz_category_scrape_controller  (leaf nodes only)
+                                        ↓
+3. AmzRankings           →  staging.amz_ranking_snapshot  (bestseller + new_release)
+                                        ↓
+4. AmzProducts           →  staging.amz_product_snapshot  (product detail pages)
+```
+
+**Step 1 — Category hierarchy (prerequisite, run once per market):**
+
+`AmzCategoryHierarchy` spider navigates the bestseller left-nav sidebar (same `role="treeitem"` structure as India `AmzCategoryUrls`) and writes directly to DB — no intermediate JSON file. Scoped to the 10 categories in `docs/chosen_categories.csv`. Populates two tables (see §0.4).
+
+**Step 3 — Rankings pages (10 categories, configurable depth):**
+
+`AmzRankings` spider accepts `list_type` param (`bestseller` or `new_release`). Reads pending entries from `amz_category_scrape_controller`. Depth is configurable via `DEPTH_LIMIT` setting.
+
+| list_type | URL pattern | Products per run |
+|---|---|---|
+| `bestseller` | `amazon.com/bestsellers/<url_slug>` | up to 100 per leaf node |
+| `new_release` | `amazon.com/gp/new-releases/<url_slug>` | up to 100 per leaf node |
+
+**Fields captured from ranking pages (available without product detail fetch):**
+
+| Field | Source | Notes |
+|---|---|---|
+| `asin` | `data-asin` attribute | Primary key |
+| `rank_position` | Rank badge | 1–100 |
+| `title` | Title element | For manual review |
+| `rating` | Star widget | Scoring signal |
+| `review_count` | Ratings count | Scoring signal |
+| `price` | Price element | Scoring signal; NULL if absent |
+| `product_url` | Raw `href` from anchor | Stored as-is — ref params intact for bot evasion |
+| `subcategory_node_id` | URL param `rh=n%3A{id}` | Links to `amz_category` |
+
+**Step 4 — Product detail pages:**
+
+`AmzProducts` spider uses the raw `product_url` from `amz_ranking_snapshot` directly — never constructs URLs. Fields captured: `bsr_rank`, `monthly_sales`, `brand`, `has_variants`, `is_small_business`, `is_fba`, `launch_date`, `seller_id`, `sell_mrp`. Schema TBD — deferred to after ranking spider is validated.
+
+### 0.3 Scraper Setup
+
+**India spider mapping — what we reuse vs replace:**
+
+| India spider | What it did | US equivalent | Change |
+|---|---|---|---|
+| `AmzCategoryUrls` | Traverses bestseller nav, saves URLs to `.txt` file | `AmzCategoryHierarchy` | Writes to DB instead; captures node IDs and parent-child relationships |
+| `CategoryRefresh` | Builds nested JSON hierarchy, saves to file; `parse_category_mapping.py` loads to DB via `lvl1`…`lvl8` columns | Replaced by `AmzCategoryHierarchy` | Direct DB write; closure table instead of fixed-depth lvl columns |
+| `AmzCategory` | Scrapes ranking pages, reads URLs from `.txt` file | `AmzRankings` | Reads from DB controller; single spider with `list_type` param |
+| `AmzProducts` | Scrapes product detail pages from DB queue | `AmzProducts` | Minimal changes; update selectors for .com |
+
+**Anti-bot stack (carry over from India — proven working):**
+
+1. **Random user agents** — `scrapy_user_agents.RandomUserAgentMiddleware`. Default UA middleware disabled.
+2. **Header rotation** — `HeaderRotationMiddleware`: two groups of real browser header templates, alternates by weekday, random pick within group. Does not override User-Agent or Cookie headers.
+3. **Adaptive delay** — `DelayHandler`: increases delay exponentially on empty/blocked responses, decreases on clean runs. Operates on live Scrapy downloader slot — no restart needed.
+4. **Oxylabs proxy** — `RandomizedProxyMiddleware`: built, commented out by default. Enable if Amazon.com blocks direct requests. Credentials in `.secrets/`.
+
+**Settings for `AmzRankings` (listing pages — rate-limit sensitive):**
+```python
+DOWNLOAD_DELAY = 8
+RANDOMIZE_DOWNLOAD_DELAY = True
+CONCURRENT_REQUESTS = 16
+CONCURRENT_REQUESTS_PER_DOMAIN = 16
+CONCURRENT_REQUESTS_PER_IP = 4
+DEPTH_LIMIT = 10          # configurable — max subcategory depth to traverse
+RETRY_TIMES = 1
+RETRY_DELAY = 15
+```
+
+**Settings for `AmzProducts` (product pages — can be more aggressive):**
+```python
+DOWNLOAD_DELAY = 2
+RANDOMIZE_DOWNLOAD_DELAY = True
+CONCURRENT_REQUESTS = 32
+CONCURRENT_REQUESTS_PER_DOMAIN = 32
+CONCURRENT_REQUESTS_PER_IP = 4
+RETRY_TIMES = 3
+RETRY_HTTP_CODES = [429, 503, 403]
+```
+
+### 0.4 Storage
+
+**Database:** `ecom_intel` on localhost Postgres. Separate from India `ecommerce` DB — do not mix. Admin credentials in `.secrets/admin_creds.env`.
+
+**Schema layout:**
+
+| Schema | Purpose |
+|---|---|
+| `staging` | Raw scrape output from spiders — as close to source as possible |
+| `transformed` | Reference tables, cleaned data, scrape state/controllers |
+| `monitoring` | Scrape run stats, null rate tracking, validation alerts |
+| `curated` | (Phase 1+) Business logic, scoring, reporting-ready |
+
+**All tables** include `marketplace_id` as a column and part of the primary key (multi-market design, Option A).
+
+---
+
+**Table DDL — create in this order:**
+
+```sql
+-- 1. Schemas
+CREATE SCHEMA IF NOT EXISTS staging;
+CREATE SCHEMA IF NOT EXISTS transformed;
+CREATE SCHEMA IF NOT EXISTS monitoring;
+CREATE SCHEMA IF NOT EXISTS curated;
+
+-- 2. Market lookup (seed with 'amazon_us' before running any spider)
+CREATE TABLE transformed.marketplaces (
+    marketplace_id   VARCHAR(20) PRIMARY KEY,  -- 'amazon_us', 'amazon_in', 'amazon_uk'
+    platform         VARCHAR(20),              -- 'amazon'
+    country_code     CHAR(2),
+    currency         CHAR(3),
+    domain           VARCHAR(50),              -- 'amazon.com', 'amazon.in'
+    is_active        BOOLEAN DEFAULT TRUE
+);
+
+-- 3. Category nodes — one row per Amazon browse node
+CREATE TABLE transformed.amz_category (
+    marketplace_id   VARCHAR(20) REFERENCES transformed.marketplaces(marketplace_id),
+    node_id          VARCHAR(30),
+    node_name        VARCHAR(255),
+    url_slug         VARCHAR(100),   -- used in URL: amazon.com/bestsellers/<url_slug>
+    parent_node_id   VARCHAR(30),    -- NULL for the 10 root categories
+    depth            SMALLINT,       -- 0 = one of our 10 root categories
+    is_leaf          BOOLEAN,
+    is_active        BOOLEAN DEFAULT TRUE,
+    first_seen_at    TIMESTAMP DEFAULT NOW(),
+    last_verified_at TIMESTAMP,
+    PRIMARY KEY (marketplace_id, node_id)
+);
+
+-- 4. Category hierarchy — closure table (all ancestor→descendant pairs incl. self)
+--    Replaces the India lvl1…lvl8 fixed-column approach.
+--    Query all leaf nodes under a root: WHERE ancestor_node_id = X AND depth_from_ancestor > 0
+CREATE TABLE transformed.amz_category_hierarchy (
+    marketplace_id        VARCHAR(20) REFERENCES transformed.marketplaces(marketplace_id),
+    ancestor_node_id      VARCHAR(30),
+    descendant_node_id    VARCHAR(30),
+    depth_from_ancestor   SMALLINT,    -- 0 = self, 1 = direct child, etc.
+    PRIMARY KEY (marketplace_id, ancestor_node_id, descendant_node_id)
+);
+
+-- 5. Scrape controller — one row per (marketplace, list_type, category, subcategory)
+--    Seeded from amz_category leaf nodes. Spider reads this to know what/where to scrape.
+CREATE TABLE transformed.amz_category_scrape_controller (
+    marketplace_id        VARCHAR(20) REFERENCES transformed.marketplaces(marketplace_id),
+    list_type             VARCHAR(20),            -- 'bestseller', 'new_release'
+    category              VARCHAR(100),
+    subcategory           VARCHAR(100),
+    subcategory_node_id   VARCHAR(30),
+    max_depth_configured  SMALLINT,
+    depth_scraped_upto    SMALLINT DEFAULT 0,
+    last_scraped_at       TIMESTAMP,
+    scrape_status         VARCHAR(20) DEFAULT 'pending',  -- 'pending','in_progress','complete'
+    PRIMARY KEY (marketplace_id, list_type, category, subcategory)
+);
+
+-- 6. Ranking snapshot — raw append output of AmzRankings spider
+--    Short-term buffer. Duplicates possible from resume scenarios.
+--    Promoted to transformed.amz_ranking via MERGE after each run.
+CREATE TABLE staging.amz_ranking_snapshot (
+    run_id              UUID,
+    marketplace_id      VARCHAR(20) REFERENCES transformed.marketplaces(marketplace_id),
+    list_type           VARCHAR(20),
+    category            VARCHAR(100),
+    subcategory         VARCHAR(100),
+    subcategory_node_id VARCHAR(30),
+    depth               SMALLINT,
+    rank_position       SMALLINT,
+    asin                VARCHAR(20),
+    title               TEXT,
+    rating              NUMERIC(3,2),
+    review_count        INTEGER,
+    price               NUMERIC(10,2),
+    product_url         TEXT,           -- raw href from page, ref params intact
+    scraped_at          TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY (run_id, marketplace_id, list_type, subcategory_node_id, asin)
+);
+CREATE INDEX ON staging.amz_ranking_snapshot (marketplace_id, list_type, scraped_at);
+
+-- 7. Ranking — deduplicated, permanent store (promoted from staging via MERGE)
+--    Merge key: (marketplace_id, list_type, subcategory_node_id, asin, scrape_date)
+--    Rationale: same ASIN can rank in multiple subcategories on the same day —
+--    subcategory_node_id is required in the key to preserve those distinct appearances.
+--    scrape_date preserves the time series across daily/weekly runs.
+CREATE TABLE transformed.amz_ranking (
+    marketplace_id      VARCHAR(20) REFERENCES transformed.marketplaces(marketplace_id),
+    list_type           VARCHAR(20),
+    category            VARCHAR(100),
+    subcategory         VARCHAR(100),
+    subcategory_node_id VARCHAR(30),
+    scrape_date         DATE,
+    run_id              UUID,           -- run that last wrote this row
+    depth               SMALLINT,
+    rank_position       SMALLINT,
+    asin                VARCHAR(20),
+    title               TEXT,
+    rating              NUMERIC(3,2),
+    review_count        INTEGER,
+    price               NUMERIC(10,2),
+    product_url         TEXT,
+    PRIMARY KEY (marketplace_id, list_type, subcategory_node_id, asin, scrape_date)
+);
+CREATE INDEX ON transformed.amz_ranking (marketplace_id, list_type, scrape_date);
+CREATE INDEX ON transformed.amz_ranking (asin, marketplace_id, scrape_date);
+
+-- MERGE logic (runs as post-spider step):
+-- WHEN MATCHED (same ASIN + subcategory + day, duplicate from resume) → UPDATE with latest values
+-- WHEN NOT MATCHED (new day or new ASIN/subcategory combo) → INSERT
+
+-- 8. Product snapshot — output of AmzProducts spider (schema TBD, deferred)
+--    Will be designed after ranking spider is validated.
+
+-- 8. Monitoring — null rate tracking per run per field
+CREATE TABLE monitoring.scrape_run_field_stats (
+    run_id          UUID,
+    spider_name     VARCHAR(50),
+    run_date        DATE,
+    marketplace_id  VARCHAR(20),
+    field_name      VARCHAR(100),
+    total_records   INTEGER,
+    null_count      INTEGER,
+    null_rate       NUMERIC(5,4),
+    PRIMARY KEY (run_id, field_name)
+);
+```
+
+**HTML archiving (validation + backfill support):**
+
+Every product page HTML is saved to disk as gzip, alongside the scrape. Stored in `html_archive/<spider_name>/<date>/<asin>.html.gz`. Pointer stored in the relevant snapshot table as `html_file_path VARCHAR(500)`. Retention: 7 days (cleanup script deletes files older than 7 days). Storage estimate: ~40 KB/page compressed; 35k pages/day ≈ 1.4 GB/day.
+
+Purpose: if the validation pipeline flags an abnormal null rate spike (indicating Amazon changed a selector), the archived HTML lets you re-parse with the corrected XPath without waiting for the next scrape run.
+
+### 0.5 Scoring Rubric (SQL)
+
+```sql
+-- Stage 1: hard disqualifiers
+WITH filtered AS (
+    SELECT *
+    FROM amazon_us_product_snapshot
+    WHERE scraped_at::DATE = CURRENT_DATE
+      AND rating >= 3.5
+      AND price >= 15.0
+      AND review_count <= 2000 OR rating <= 4.5   -- not a locked winner
+),
+
+-- Stage 2: opportunity score
+scored AS (
+    SELECT *,
+        -- Signal 1: proven demand, weak execution
+        CASE WHEN bsr_rank <= 100 AND rating BETWEEN 3.5 AND 4.2 THEN 3 ELSE 0 END
+        -- Signal 2: new release gaining traction early
+        + CASE WHEN source = 'new_release' AND review_count < 150 AND rating >= 4.0 THEN 3 ELSE 0 END
+        -- Signal 3: selling fast relative to review count (still enterable)
+        + CASE WHEN monthly_sales IS NOT NULL AND review_count > 0
+               AND (monthly_sales::float / review_count) > 10 THEN 2 ELSE 0 END
+        -- Signal 4: price room (in bottom 30% of category price range)
+        + CASE WHEN price < PERCENTILE_CONT(0.3) WITHIN GROUP (ORDER BY price)
+                              OVER (PARTITION BY category) THEN 2 ELSE 0 END
+        -- Signal 5: small seller, no brand moat
+        + CASE WHEN is_small_business THEN 1 ELSE 0 END
+        -- Signal 6: no variants = you can enter with a bundle/variant
+        + CASE WHEN has_variants = FALSE THEN 1 ELSE 0 END
+        AS opportunity_score,
+        -- Stage 3 tiebreakers (median context)
+        review_count < PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY review_count)
+                        OVER (PARTITION BY category) AS below_median_reviews,
+        rating < AVG(rating) OVER (PARTITION BY category) AS below_avg_rating
+    FROM filtered
+)
+
+SELECT
+    asin, title, category, source, bsr_rank, price, rating, review_count,
+    monthly_sales, brand, has_variants, is_small_business,
+    opportunity_score,
+    -- apply tiebreaker bonuses
+    opportunity_score
+        + CASE WHEN below_median_reviews THEN 1 ELSE 0 END
+        + CASE WHEN below_avg_rating AND rating >= 3.5 THEN 1 ELSE 0 END
+    AS final_score
+FROM scored
+WHERE opportunity_score >= 4     -- pre-filter noise
+ORDER BY final_score DESC
+LIMIT 30;
+```
+
+**Threshold: final_score ≥ 6 → shortlist. ≥ 8 → prioritise.**
+
+### 0.6 Output and Next Action
+
+The query produces a ranked list of ~10–30 product candidates. From here:
+
+1. **Manual gut check (top 10–15):** Is the complaint fixable? Can it be sourced? Does the current listing look beatable (weak images, thin copy, no A+ content)?
+2. **Shortlist to 5 finalists.**
+3. **Pull Keepa history on finalists only** — subscribe to Keepa entry plan (€49/mo), fetch 12-month BSR + price + review history for those specific ASINs. This validates whether the opportunity is stable or already declining. ~15 ASINs costs negligible tokens.
+4. **Select 1–2 products** to take to the consultant (Rishi) for supplier discovery.
+
+### 0.7 Transition Trigger to Phase 1
+
+Move to Phase 1 (Keepa browse node pipeline + category scoring engine) **only when:**
+
+- A product is selected and you need to understand the full competitive landscape of its category at depth, OR
+- You want ongoing price/BSR monitoring across the 14 categories after launch, OR
+- The snapshot approach misses too many opportunities because it lacks trend data
+
+Until one of those triggers is true, Phase 0 output is sufficient for the current business decision.
+
+---
+
 ## 1. Overview and Goals
+
+> **Phase 0 precedes everything in this document.** Before building any pipeline described here, complete §0 (direct scraping → product shortlist). This platform is only built once a product is selected and ongoing monitoring is needed.
 
 This platform ingests Amazon US marketplace data from multiple vendor APIs, stores it in a layered Iceberg lakehouse on object storage, and serves it via SQL (Trino) for product discovery, pricing intelligence, and trend analysis.
 
@@ -105,7 +445,8 @@ Vendors are onboarded in three deliberate phases — never all simultaneously. E
 
 | Phase | Trigger | Vendors active | Purpose |
 |---|---|---|---|
-| **Phase 1 — Niche selection** | Day 1 | Keepa only | Category opportunity scoring across all US browse nodes. Keepa's category endpoint covers all 6 scoring signals alone. ~$20–50/mo. |
+| **Phase 0 — Product shortlist** | Immediate — no paid APIs | Direct Scrapy scraping | Scrape bestseller + new release pages for 14 categories. Score products via SQL. No API cost. See §0 for full details. |
+| **Phase 1 — Niche validation** | After product shortlist from Phase 0 | Keepa only | Pull 12-month BSR/price/review history on Phase 0 finalists (~5 ASINs). Then build full category scoring if needed. ~€49/mo. |
 | **Phase 2 — Niche deep dive** | After category is selected | + Rainforest API | Real-time product/offer/review snapshots for the chosen category. ASIN universe already built from Keepa. ~$50–100/mo added. |
 | **Phase 3 — Launch prep** | After product is selected | + SerpApi | Keyword/search positioning, share of voice, organic vs sponsored ranking. ~$50/mo added. |
 
@@ -227,9 +568,11 @@ All `transformed.*` tables are keyed by `(platform, platform_product_id)` — ne
 
 ---
 
-## 3.7 Category Opportunity Scoring Engine — First Deliverable
+## 3.7 Category Opportunity Scoring Engine — Phase 1 Deliverable
 
-**Purpose**: Answer "which Amazon US category should I enter?" before any product-level work. This is the first analytical output built on the platform.
+> **This is a Phase 1 output, not Phase 0.** Phase 0 (§0) produces a product shortlist from a current snapshot without Keepa. This engine is built only if Phase 0 doesn't surface enough signal or ongoing category monitoring is needed post-launch.
+
+**Purpose**: Answer "which Amazon US category should I enter?" with historical trend depth. Built on top of Keepa data, not scraped snapshots.
 
 Built entirely from Phase 1 data (Keepa only). Six scoring signals:
 
@@ -508,96 +851,152 @@ Monitor via Spark Web UI (`vm-spark-master:8080`) — shows active jobs, stages,
 
 ## 5. Repository Structure
 
-Two repos, as planned:
+### Active repo: `ecom-intelligence` (this repo)
 
-### Repo 1: `ecom-orchestration` (DAGs only)
-```
-ecom-orchestration/
-  dags/
-    ingestion/
-      keepa_browse_nodes.py       ← FIRST DAG built (browse node hierarchy)
-      keepa_daily.py
-      rainforest_snapshots.py     ← Phase 2+
-      serpapi_search.py           ← Phase 3+
-      spapi_inventory.py          ← when seller account exists
-    processing/
-      spark_raw_to_clean.py       ← triggers ecom-spark image
-      spark_clean_to_transformed.py
-      dbt_transformed_to_curated.py  ← triggers ecom-dbt image
-    maintenance/
-      iceberg_compaction.py
-      cleanup.py
-  plugins/
-    common/
-      notifications.py
-      sensors.py
-  config/
-    dag_defaults.yaml             ← default_args, retry policy, DockerOperator config
-  tests/
-  requirements.txt                ← lightweight: apache-airflow + providers only
-  .github/
-    workflows/
-      deploy-dags.yml
-```
+All Phase 0 work lives here. Phase 1+ code is added to the same repo as each phase begins.
 
-### Repo 2: `ecom-intelligence` (Scripts, PySpark jobs, dbt models)
 ```
 ecom-intelligence/
+  CLAUDE.md
+  docs/                             ← project documentation (exists)
+  .secrets                          ← gitignored — API keys, proxy credentials
+  .gitignore
+
+  ── Phase 0 (build this first) ──────────────────────────────────────────
+
+  scraping/                         ← Scrapy project root (run all scrapy commands from here)
+    scrapy.cfg                      ← points to settings module
+    spiders/
+      __init__.py
+      amz_category_hierarchy.py     ← FIRST: traverses bestseller nav, writes category tree to DB
+      amz_rankings.py               ← SECOND: scrapes bestseller/new_release pages (list_type param)
+      amz_products.py               ← THIRD: scrapes product detail pages using raw URLs from ranking table
+    helpers/
+      __init__.py
+      postgres_handler.py           ← DB connection + bulk_upsert (ported from India)
+      delay_handler.py              ← adaptive delay logic (ported from India)
+      constants.py                  ← LOG_DIR, file size constants
+    middlewares.py                  ← HeaderRotationMiddleware + proxy middlewares (ported from India)
+    header_templates.py             ← real browser header groups for HeaderRotationMiddleware
+    settings.py                     ← DB creds, target categories, middleware stack, Scrapy config
+    pipelines.py                    ← writes to ecom_intel Postgres + HTML archive
+    items.py                        ← AmzCategoryItem, AmzRankingItem, AmzProductItem
+    db/
+      ddl.sql                       ← all CREATE TABLE statements (§0.4 order)
+      seed_marketplaces.sql         ← INSERT into transformed.marketplaces for amazon_us
+      seed_controller.sql           ← seeds amz_category_scrape_controller from leaf nodes
+
+  analysis/                         ← scoring and exploration
+    sql/
+      01_create_snapshot_table.sql  ← creates amazon_us_product_snapshot table
+      02_opportunity_scoring.sql    ← the full 4-stage scoring rubric
+    notebooks/
+      product_shortlist.ipynb       ← explore scored output, shortlist manually
+
+  ── Phase 1+ (build after product is selected) ──────────────────────────
+
   pipelines/
-    ingestion/                    ← Python: vendor API → R2 landing → raw Iceberg
+    ingestion/                      ← vendor API → R2 landing → raw Iceberg
       keepa/
-        browse_nodes.py           ← FIRST script built
-        products.py
-        categories.py
-      rainforest/                 ← Phase 2+
-      serpapi/                    ← Phase 3+
-      spapi/
-    spark/                        ← PySpark: raw → clean → transformed
+        browse_nodes.py             ← FIRST Phase 1 script (US category tree)
+        products.py                 ← batch ASIN fetch
+      rainforest/                   ← Phase 2+
+      serpapi/                      ← Phase 3+
+      spapi/                        ← when seller account exists
+    spark/                          ← PySpark: raw → clean → transformed
       raw_to_clean/
         amazon_products.py
         amazon_bsr.py
         amazon_reviews.py
       clean_to_transformed/
-        product_master.py         ← unified cross-platform join
+        product_master.py           ← unified cross-platform join
         price_history.py
         bsr_trends.py
-  warehouse/                      ← dbt-spark: transformed → curated
+
+  warehouse/                        ← dbt-spark: transformed → curated
     models/
-      staging/                    ← thin views over transformed.* (platform-tagged)
+      staging/
         amazon/
-      intermediate/               ← cross-platform unified models (int_*)
+      intermediate/                 ← cross-platform unified models (int_*)
       marts/
-        opportunity/              ← category_opportunity_scores (FIRST mart built)
+        opportunity/                ← category_opportunity_scores
         product_research/
         competitor_tracking/
     dbt_project.yml
-    profiles.yml                  ← points to Spark Thrift Server
-  libraries/
-    vendors/                      ← vendor API clients (Keepa, Rainforest, etc.)
-    io/                           ← S3/R2 helpers, Iceberg writer utilities
-    validation/                   ← schema validation, quarantine logic
-    common/                       ← logging, metrics, config loader
-  notebooks/
-    category_scoring.ipynb        ← first notebook (explore curated.opportunity_scores)
-    product_deep_dive.ipynb       ← Phase 2+
+    profiles.yml                    ← points to Spark Thrift Server
+
+  libraries/                        ← shared Phase 1+ utilities
+    vendors/                        ← API clients (Keepa, Rainforest, etc.)
+    io/                             ← S3/R2 helpers, Iceberg writer utilities
+    validation/                     ← schema validation, quarantine logic
+    common/                         ← logging, metrics, config loader
+
+  notebooks/                        ← Phase 1+ analysis
+    category_scoring.ipynb
+    product_deep_dive.ipynb
+
   tests/
   pyproject.toml
-  Dockerfile.ingestion            ← lightweight Python image (ecom-intelligence)
-  Dockerfile.spark                ← PySpark image with Iceberg/Nessie jars (ecom-spark)
-  Dockerfile.dbt                  ← dbt-spark image (ecom-dbt)
+  Dockerfile.scraping               ← Phase 0: Scrapy image (if containerized later)
+  Dockerfile.ingestion              ← Phase 1+: lightweight Python image
+  Dockerfile.spark                  ← Phase 1+: PySpark + Iceberg/Nessie jars
+  Dockerfile.dbt                    ← Phase 1+: dbt-spark image
   .github/
     workflows/
       build-and-push.yml
       run-tests.yml
 ```
 
-**Why two repos**:
-- Orchestration (DAGs, schedules, retries) and data logic (transforms, models) release independently
-- DAG repo is lightweight — no heavy dependencies, deploys via file sync to Airflow
-- Pipeline repo builds three Docker images with different dependency sets
-- Different on-call surface: DAG failures are orchestration issues; transform failures are data issues
+### Future repo: `orchestration` (Phase 1+ only — not yet created)
 
-**Dependency between repos**: Orchestration DAGs reference pipeline images by tag (e.g., `ecom-spark:v1.4.2`). Image tags are pinned in `dag_defaults.yaml` and bumped as part of the pipeline repo release process.
+Generic orchestration repo — not scoped to ecom-intelligence. Any project needing scheduled pipelines lands here. Projects are isolated by top-level folder. A `shared/` folder holds operators, hooks, and utilities reusable across projects.
+
+**DAGs are written last.** For any phase, DAGs are only added after the phase scripts in `ecom-intelligence` are tested end-to-end and considered deployment-ready. A DAG that calls untested scripts is just scheduled failures.
+
+```
+orchestration/
+  ecom-intelligence/                ← ecom project DAGs
+    dags/
+      phase1/
+        keepa_browse_nodes.py       ← FIRST DAG (Phase 1)
+        keepa_daily.py
+        rainforest_snapshots.py     ← Phase 2+
+        serpapi_search.py           ← Phase 3+
+        spapi_inventory.py          ← when seller account exists
+      processing/
+        spark_raw_to_clean.py
+        spark_clean_to_transformed.py
+        dbt_transformed_to_curated.py
+      maintenance/
+        iceberg_compaction.py
+    config/
+      dag_defaults.yaml             ← pinned image tags, retry policy
+    tests/
+
+  <future-project>/                 ← other projects land here, same structure
+    dags/
+    config/
+    tests/
+
+  shared/                           ← generic, reusable across all projects
+    operators/                      ← custom Airflow operators
+    hooks/                          ← custom Airflow hooks
+    utils/                          ← shared Python utilities for DAGs
+
+  requirements.txt
+  .github/
+    workflows/
+      deploy-dags.yml
+```
+
+**Why two repos (Phase 1+)**:
+- `orchestration` is lightweight — no heavy dependencies, deploys via rsync to Airflow
+- `ecom-intelligence` builds Docker images with heavy dependencies (Spark, dbt, vendor SDKs)
+- DAG failures and transform failures have different on-call surfaces
+- Orchestration and data logic release independently
+- Other projects can use `orchestration` without pulling in ecom-specific code
+
+**Dependency**: DAGs reference `ecom-intelligence` pipeline images by tag (e.g., `ecom-spark:v1.4.2`), pinned in `ecom-intelligence/config/dag_defaults.yaml`.
 
 ---
 
@@ -706,6 +1105,77 @@ This goes into a lightweight Iceberg table, not ad-hoc logs.
 
 ## 9. Data Flow Diagram
 
+### Phase 0 (current — execute first)
+
+```
+── Step 0: Category hierarchy (run once per market, prerequisite) ──────────────────
+
+Amazon.com /bestsellers/<category> nav sidebar  (10 categories)
+         │
+         ▼
+  AmzCategoryHierarchy spider
+  Traverses role="treeitem" links, captures node_id + node_name + parent + url_slug
+         │
+         ├──► transformed.amz_category          (one row per node)
+         └──► transformed.amz_category_hierarchy (closure table — all ancestor-descendant pairs)
+                       │
+                       ▼
+              seed_controller.sql  (SELECT leaf nodes → INSERT INTO amz_category_scrape_controller)
+
+── Step 1: Rankings (on-demand, repeatable) ────────────────────────────────────────
+
+transformed.amz_category_scrape_controller  (pending leaf nodes)
+         │
+         ▼
+  AmzRankings spider  (list_type = 'bestseller' | 'new_release')
+  Anti-bot: random UA + HeaderRotationMiddleware + DelayHandler → Oxylabs proxy fallback
+  Depth: configurable via DEPTH_LIMIT setting
+         │
+         ├──► staging.amz_ranking_snapshot
+         │    Fields: run_id, asin, rank_position, title, rating, review_count,
+         │            price, product_url (raw href), subcategory_node_id, depth
+         │
+         ├──► html_archive/<date>/<asin>.html.gz  (7-day retention)
+         │
+         └──► monitoring.scrape_run_field_stats   (null rates per field per run)
+                       │
+                       ▼
+              Validation check: null rate vs threshold / rolling 4-run avg
+              Alert if spike detected (selector likely changed)
+
+── Step 2: Product details (after ranking validated) ───────────────────────────────
+
+staging.amz_ranking_snapshot  (ASINs + raw product_url)
+         │
+         ▼
+  AmzProducts spider  (uses raw product_url — never constructs URLs)
+         │
+         ├──► staging.amz_product_snapshot  (schema TBD)
+         │    Fields: bsr_rank, monthly_sales, brand, has_variants,
+         │            is_small_business, is_fba, launch_date, sell_mrp
+         │
+         └──► html_archive/<date>/<asin>.html.gz  (7-day retention)
+
+── Step 3: Scoring ─────────────────────────────────────────────────────────────────
+
+SQL scoring query (analysis/sql/02_opportunity_scoring.sql)
+4 stages: hard disqualifiers → signal scoring → median tiebreakers → ranked output
+         │
+         ▼
+  product_shortlist.ipynb → 10–15 ranked product candidates
+         │
+         ▼
+  Manual gut check (listing quality, sourcing feasibility, complaint fixability)
+         │
+         ▼
+  Keepa history pull on 5 finalists only (~15 ASINs, negligible token cost)
+         │
+         ▼
+  Product selection → triggers Phase 1
+```
+
+### Phase 1+ (future — triggered by product selection or need for ongoing monitoring)
+
 ```
 Vendor APIs (phased onboarding)
   ├── Keepa              (Phase 1 — Truth C)
@@ -789,6 +1259,8 @@ All major decisions are closed. Recorded here for future reference.
 
 | Decision | Choice | Rationale |
 |---|---|---|
+| First step before any infra | **Phase 0: direct Scrapy scraping** | Get a product shortlist in days using zero paid infrastructure. The full platform is only needed for ongoing monitoring post-product-selection. Direct scraping of bestseller + new releases pages gives enough signal (BSR, rating, review count, monthly sales) to score and shortlist products. |
+| Anti-bot strategy for Phase 0 | **Random user-agents + custom headers, Oxylabs proxy as fallback** | India spiders already have this setup working. Oxylabs credentials available if Amazon.com blocks direct requests. |
 | Object storage | **Cloudflare R2** | Zero egress fees; S3-compatible API; official Trino + Spark S3A support. Fallback: Backblaze B2 if R2+S3A multipart issues cannot be resolved. |
 | Compute | **Hetzner Cloud** | 3–5x cheaper per vCPU/RAM vs AWS/DO. All VMs in same region = free private network traffic. |
 | Iceberg catalog | **Project Nessie** (self-hosted) | Lightweight JVM, not cloud-locked, supports branching for dev/prod isolation. Shared by both Spark and Trino. |
@@ -800,8 +1272,24 @@ All major decisions are closed. Recorded here for future reference.
 | Spark cluster | **Standalone on Docker/Hetzner** | Cheapest, no Kubernetes overhead. Migrate to IOMETE on Kubernetes at Phase 3 scale (300+ TB) — PySpark code unchanged. |
 | Container runtime | **Docker on VM** | Consistent with existing pattern. DockerOperator triggers ingestion, Spark, and dbt images. |
 | Container registry | **GitHub Container Registry** | Free tier, stays within existing GitHub setup. |
-| Repo count | **2 repos** (`ecom-orchestration` + `ecom-intelligence`) | DAGs and data logic release independently. Three Docker images (ingestion, spark, dbt) built from pipeline repo. |
+| Repo count | **2 repos** (`orchestration` + `ecom-intelligence`) | DAGs and data logic release independently. Three Docker images (ingestion, spark, dbt) built from `ecom-intelligence`. |
+| `orchestration` repo scope | **Generic — multi-project** | Not scoped to ecom-intelligence. Projects are isolated by top-level folder (`ecom-intelligence/`, `<future-project>/`). A `shared/` folder holds operators/hooks/utils reusable across all projects. Named `orchestration` (not `ecom-orchestration`) to stay tool-agnostic and project-agnostic. |
+| DAG development timing | **DAGs written last per phase** | DAGs are wiring, not logic. Added to `orchestration` only after the corresponding phase scripts in `ecom-intelligence` are tested end-to-end and deployment-ready. |
+| Ranking data layers | **staging + transformed** (two tables) | `staging.amz_ranking_snapshot` = raw spider append, short-term buffer, duplicates possible from resume. `transformed.amz_ranking` = permanent deduplicated store, promoted via MERGE post-spider. Queries and scoring always run against transformed, never staging. |
+| Ranking dedup key | **(marketplace_id, list_type, subcategory_node_id, asin, scrape_date)** | Same ASIN can legitimately rank in multiple subcategories on the same day — subcategory_node_id must be in the key to preserve those distinct appearances. scrape_date preserves the time series across runs. Resume duplicates (same ASIN + subcategory + day) are resolved via MERGE UPDATE. |
+| Controller reset strategy | **Time-based with configurable N** (`min_days_since_last_scrape`) | Resets `scrape_status = pending` only for nodes where `last_scraped_at < NOW() - INTERVAL 'N days'`. Prevents redundant re-scraping if spider is triggered twice in a day. N passed as spider argument at runtime; default = 1. |
 | Spark cluster evolution | Standalone → IOMETE/K8s | Trigger: Phase 3 scale or operational pain. Code unchanged — only cluster management layer swaps. |
+| Local DB name | **`ecom_intel`** | Generic name — not US-specific, supports all future markets. Separate from the India `ecommerce` DB which is a frozen read-only archive. |
+| Multi-market DB schema | **Option A — `marketplace_id` as column** | Single schema set shared across all markets. Schema-per-market (Option B) rejected — cross-market queries would require UNION ALL everywhere. Every table has `marketplace_id` as part of its primary key. |
+| Marketplace reference table | **`transformed.marketplaces`** | Lookup for all active markets (marketplace_id, platform, country_code, currency, domain). Every staging and transformed table FK-references this. |
+| Category hierarchy storage | **Closure table** (`amz_category_hierarchy`) | Replaces India's fixed `lvl1`…`lvl8` column approach. Any ancestor-descendant query is a simple join; no hard-coded depth limit; works regardless of how deep Amazon's tree goes. |
+| Category spider output | **Direct DB write** | India approach saved to JSON file → separate `parse_category_mapping.py` script to load. We write directly to `amz_category` + `amz_category_hierarchy` from the spider pipeline. Eliminates the intermediate file step. |
+| Ranking spider design | **Single `AmzRankings` spider with `list_type` param** | India had `AmzCategory` reading from a `.txt` URL file. We read from `amz_category_scrape_controller` and pass `list_type` as a parameter. One spider handles both bestseller and new_release. |
+| `product_url` storage | **Raw href, ref params intact** | Constructed URLs (without Amazon's ref/navigation params) are easier for bot detection systems to identify. Store exactly what's on the page. Used by `AmzProducts` spider directly. |
+| `page_num` in ranking table | **Dropped** | Redundant — `rank_position` (1–100) already encodes position across both pagination pages. |
+| HTML archiving | **Gzipped HTML on local disk, 7-day retention** | Amazon's CSS/XPath selectors can change without warning. Archiving lets you re-parse with corrected selectors without re-scraping. ~40 KB/page compressed; ~1.4 GB/day at 35k ASINs. Pointer stored as `html_file_path` in snapshot tables. |
+| Validation pipeline | **Null rate comparison per field per run** | Stored in `monitoring.scrape_run_field_stats`. Compare against fixed thresholds (Mode A, start here) or rolling 4-run average (Mode B, add once history exists). Spike in null rate = selector likely changed. |
+| Scrape controller | **`transformed.amz_category_scrape_controller`** | Same pattern as India's `amz__category_refresh_controller`. Tracks `depth_scraped_upto` and `scrape_status` per leaf node per list_type. Enables resume on failure and incremental scraping. |
 
 **Open item**: Verify R2 + Spark S3A multipart upload compatibility in dev before building any PySpark pipeline. See Section 4.8 for known risk and workarounds.
 

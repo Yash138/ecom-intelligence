@@ -1,0 +1,15 @@
+# python version: 3.12
+
+# Core scraping
+scrapy>=2.11.0
+scrapy-user-agents>=0.1.1
+
+# Database
+psycopg2-binary>=2.9.0
+
+# Config / env
+python-dotenv>=1.0.0
+
+# Analysis / notebooks
+pandas
+ipykernel
