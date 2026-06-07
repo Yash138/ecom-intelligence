@@ -11,6 +11,7 @@
 | 2026-05-11 | First Thing to Build, Repo Structure | Revised to reflect Phase 0 (direct scraping) as the immediate first step before any Keepa/infra work |
 | 2026-06-03 | Project Scope, New Infra Key Decisions, Credentials | Scope expanded to multi-market; DB created (`ecom_intel`); multi-market schema decision (Option A — marketplace as column) |
 | 2026-06-04 | New Infra Key Decisions | Orchestration repo renamed `ecom-orchestration` → `orchestration`; scope made generic/multi-project |
+| 2026-06-07 | Maintenance Rules, Repo Structure, Feedback Log | Added scraping pitfalls reference; AmzCategoryHierarchy completed (8,782 nodes); current build status updated |
 
 ## Table of Contents
 
@@ -40,10 +41,11 @@
 - Keep it dense — pointers and decisions only. Link to docs; don't reproduce them.
 - Log all dev errors and user corrections in the Feedback Log section.
 - **Doc convention (all documents):** Every doc must have `## Document Update History` (table: Date | Sections Changed | Summary) immediately after the title block, then `## Table of Contents` (anchor links, 2 levels) immediately below. Update the history table on every edit.
+- **MUST READ before building any spider:** `docs/scraping_pitfalls.md` — 7 bugs hit during AmzCategoryHierarchy development. These mistakes MUST be avoided at any cost.
 
 ## Current State
 - **Old infra (exists, India):** Scrapy-based scraping of amazon.in → PostgreSQL (`ecommerce` DB). ~7.5 GB, 2.3M ASINs, 1 year history. Airflow + DockerOperator on local machine. Not being migrated — separate concern.
-- **New infra (designed, not yet built):** Amazon US, third-party vendor APIs, Iceberg lakehouse on Cloudflare R2 + Hetzner Cloud. Design finalized in `docs/new_infra/infra_design.md`. Code not started.
+- **New infra (Phase 0 in progress):** Amazon US scraping pipeline. `AmzCategoryHierarchy` spider complete — 8,782 category nodes across 10 target categories written to `ecom_intel` DB. Next: `AmzRankings` spider (bestseller + new_release pages).
 - **Active branch:** `infra_design`
 
 ## Development Approach
@@ -133,7 +135,10 @@ Jungle Scout / SellerApp = Truth Class D (estimates, store with `is_estimate=tru
 - `docs/old_infra/table_structure.md` — old India DB schema
 - `docs/old_infra/data_dictionary.md` — old India data dictionary
 - `docs/old_infra/epip_first_step_strategy.md` — strategy rationale for building category scoring first
+- `docs/scraping_pitfalls.md` — **MUST READ** — 7 hard bugs from AmzCategoryHierarchy; avoid at all costs in future spiders
+- `scraping/` — Scrapy project; flat layout (no package wrapper)
 
 ## Feedback / Error Log
 <!-- Format: YYYY-MM-DD | context | what went wrong or was corrected -->
 - 2026-05-11 | CLAUDE.md setup | Do not mix Sprouts work email with this personal project
+- 2026-06-07 | AmzCategoryHierarchy | 7 bugs fixed — full details in `docs/scraping_pitfalls.md`

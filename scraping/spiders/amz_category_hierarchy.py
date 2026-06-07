@@ -50,6 +50,7 @@ class AmzCategoryHierarchySpider(scrapy.Spider):
         self.marketplace_id = marketplace_id
         self.visited_urls: set[str] = set()
         self.visited_node_ids: set[str] = set()   # dedup by node_id — catches cross-URL cycles
+        self.target_slugs: set[str] = set()        # populated from parse_root; only follow these slugs
         self.nodes_written = 0
 
     @classmethod
@@ -114,6 +115,7 @@ class AmzCategoryHierarchySpider(scrapy.Spider):
             node_id = self._node_id(url)
             self.visited_node_ids.add(node_id)
             url_slug = self._slug(url)
+            self.target_slugs.add(url_slug)         # record slugs we're allowed to crawl
 
             self.log(f"Root category found: '{name}' → node_id={node_id}, slug={url_slug}", 20)
 
@@ -173,9 +175,17 @@ class AmzCategoryHierarchySpider(scrapy.Spider):
             if node_id in self.visited_node_ids:
                 continue
 
+            url_slug = self._slug(url)
+
+            # Only follow links within the 10 target category slugs —
+            # Amazon's nav renders all root categories on every page, which would
+            # pull in non-target categories (e.g. videogames, automotive) and
+            # create runaway depth if not filtered here.
+            if self.target_slugs and url_slug not in self.target_slugs:
+                continue
+
             self.visited_urls.add(url)
             self.visited_node_ids.add(node_id)
-            url_slug = self._slug(url)
 
             self.log(
                 f"  {'  ' * depth_level}Child: '{name}' "
