@@ -123,22 +123,44 @@ Chromium's V8 heap accumulates JS state across thousands of pages and OOMs after
 hours. `run_rankings.ps1` runs one category at a time — the browser restarts between each,
 keeping memory bounded.
 
+**Subcategory / node-level filtering is not supported in `run_rankings.ps1`.**
+For subcategory targeting, use the direct scrapy commands below.
+
+#### Sequential — all categories
+
 ```powershell
-# Full bestseller run — all 10 categories sequentially (default)
+# All 10 categories, bestseller (default)
 .\run_rankings.ps1
 
-# New releases
+# All 10 categories, new releases
 .\run_rankings.ps1 -ListType new_release
+```
 
-# Resume after a crash — skip categories already completed
+#### Sequential — resume after crash
+
+```powershell
+# Skip categories already completed; pick up from "Home & Kitchen" onwards
 .\run_rankings.ps1 -StartFrom "Home & Kitchen"
-
-# Resume new releases from a specific category
 .\run_rankings.ps1 -ListType new_release -StartFrom "Pet Supplies"
+```
 
-# Single category only — runs and stops
+#### Single category
+
+```powershell
 .\run_rankings.ps1 -Category "Pet Supplies"
 .\run_rankings.ps1 -Category "Pet Supplies" -ListType new_release
+.\run_rankings.ps1 -Category "Arts, Crafts & Sewing"
+```
+
+#### Multiple specific categories (pipe-delimited, runs sequentially)
+
+```powershell
+.\run_rankings.ps1 -Categories "Pet Supplies|Office Products"
+.\run_rankings.ps1 -Categories "Pet Supplies|Office Products" -ListType new_release
+
+# Category names that contain commas work fine with pipe delimiter
+.\run_rankings.ps1 -Categories "Arts, Crafts & Sewing|Home & Kitchen|Pet Supplies"
+.\run_rankings.ps1 -Categories "Arts, Crafts & Sewing|Clothing, Shoes & Jewelry" -ListType new_release
 ```
 
 Each category writes its own log: `logs/amz_rankings_<list_type>_<category>.log`.
@@ -150,51 +172,91 @@ psql -d ecom_intel -U ecom_intel_admin -f db/merge_rankings.sql
 
 ---
 
-### Single-category / debug runs (direct scrapy)
+### Direct scrapy commands
+
+Use these for subcategory/node-level filtering, plain-HTTP fast mode, or any scenario
+the script doesn't cover. The `categories` parameter accepts **pipe-delimited (`|`)** node
+names — works for top-level categories, intermediate nodes, and leaf nodes alike.
+Do NOT use commas as delimiter: names like `"Arts, Crafts & Sewing"` contain commas and
+would be split silently.
+
+#### Sequential — all pending nodes
 
 ```bash
-# Single category test — Playwright on
+# All categories, all pending nodes — Playwright on (production quality)
 scrapy crawl AmzRankings -a list_type=bestseller \
-  -a categories="Office Products" \
-  -s LOG_FILE=logs/amz_rankings_office_bestseller.log
+  -s LOG_FILE=logs/amz_rankings_bestseller.log
 
-# Fast mode — plain HTTP, ~60 products/node, no Playwright overhead
-# Safe to run all categories at once (no browser, no OOM risk)
+# Fast mode — plain HTTP, ~60 products/node, no OOM risk, safe to run all at once
 scrapy crawl AmzRankings -a list_type=bestseller -a use_playwright=false \
   -s LOG_FILE=logs/amz_rankings_bestseller_fast.log
 ```
 
-### Filter by category
-
-The `categories` parameter accepts one or more node names, **pipe-delimited (`|`)**.
-Commas cannot be used as the delimiter because category names themselves contain commas
-(e.g. `"Arts, Crafts & Sewing"`). Using a comma would silently split the name and match nothing.
+#### Single category
 
 ```bash
-# Single category — all nodes in its subtree
 scrapy crawl AmzRankings -a list_type=bestseller \
   -a categories="Office Products" \
-  -s LOG_FILE=logs/amz_rankings_office_bestseller.log
+  -s LOG_FILE=logs/amz_rankings_office.log
 
-# Category name that contains a comma — works fine with pipe delimiter
+# Category name with a comma — quote the whole -a value
 scrapy crawl AmzRankings -a list_type=bestseller \
   -a "categories=Arts, Crafts & Sewing" \
   -s LOG_FILE=logs/amz_rankings_arts.log
+```
 
-# Multiple categories — pipe-delimited
+#### Multiple categories
+
+```bash
 scrapy crawl AmzRankings -a list_type=bestseller \
   -a "categories=Office Products|Pet Supplies" \
   -s LOG_FILE=logs/amz_rankings_multi.log
 
-# Multiple categories where names contain commas
+# With comma-containing names
 scrapy crawl AmzRankings -a list_type=bestseller \
   -a "categories=Arts, Crafts & Sewing|Clothing, Shoes & Jewelry" \
   -s LOG_FILE=logs/amz_rankings_multi.log
+```
 
-# Intermediate or leaf node by name — scrapes that subtree
+#### Single subcategory (intermediate or leaf node)
+
+The `categories` parameter matches any node name — not just top-level categories.
+Pass an intermediate or leaf node name and the spider resolves it via the DB.
+
+```bash
+# Scrape "Staplers" + its full subtree (include_descendants=true is the default)
 scrapy crawl AmzRankings -a list_type=bestseller \
   -a categories="Staplers" \
   -s LOG_FILE=logs/amz_rankings_staplers.log
+
+# Scrape only the "Staplers" page itself — no subtree
+scrapy crawl AmzRankings -a list_type=bestseller \
+  -a categories="Staplers" -a include_descendants=false \
+  -s LOG_FILE=logs/amz_rankings_staplers.log
+
+# Intermediate node — scrapes "Dogs" + all leaf nodes beneath it
+scrapy crawl AmzRankings -a list_type=bestseller \
+  -a categories="Dogs" \
+  -s LOG_FILE=logs/amz_rankings_dogs.log
+```
+
+#### Multiple subcategories
+
+```bash
+# Two leaf nodes — scrape both pages
+scrapy crawl AmzRankings -a list_type=bestseller \
+  -a "categories=Staplers|Pens" \
+  -s LOG_FILE=logs/amz_rankings_multi_sub.log
+
+# Two intermediate nodes — scrape both subtrees
+scrapy crawl AmzRankings -a list_type=bestseller \
+  -a "categories=Dogs|Cats" \
+  -s LOG_FILE=logs/amz_rankings_multi_sub.log
+
+# Mix of levels — include_descendants expands each named node independently
+scrapy crawl AmzRankings -a list_type=bestseller \
+  -a "categories=Staplers|Dogs|Office Products" \
+  -s LOG_FILE=logs/amz_rankings_mixed.log
 ```
 
 ### `use_playwright` flag
@@ -207,12 +269,11 @@ scrapy crawl AmzRankings -a list_type=bestseller \
 ```bash
 # Full coverage (default — Playwright on)
 scrapy crawl AmzRankings -a list_type=bestseller \
-  -a categories="Carriers & Travel Products" -a include_descendants=false
+  -a categories="Office Products"
 
-# Fast mode — skip lazy-loaded items, plain HTTP
+# Fast mode — plain HTTP
 scrapy crawl AmzRankings -a list_type=bestseller \
-  -a categories="Carriers & Travel Products" -a include_descendants=false \
-  -a use_playwright=false
+  -a categories="Office Products" -a use_playwright=false
 ```
 
 ### `include_descendants` flag
@@ -223,27 +284,19 @@ scrapy crawl AmzRankings -a list_type=bestseller \
 | `false` | Scrapes only the named node itself — no subtree expansion |
 
 ```bash
-# All nodes under Office Products — root page + every intermediate + every leaf
+# Entire Office Products tree — root + every intermediate + every leaf
 scrapy crawl AmzRankings -a list_type=bestseller \
   -a categories="Office Products"
 
-# Only the "Office Products" root page, nothing below it
+# Only the "Office Products" root page, nothing below
 scrapy crawl AmzRankings -a list_type=bestseller \
   -a categories="Office Products" -a include_descendants=false
-
-# All nodes under the "Dogs" subcategory (intermediate node)
-scrapy crawl AmzRankings -a list_type=bestseller \
-  -a categories="Dogs"
-
-# Only the "Dogs" page itself
-scrapy crawl AmzRankings -a list_type=bestseller \
-  -a categories="Dogs" -a include_descendants=false
 ```
 
 ### Force re-scrape already-scraped nodes
 
 ```bash
-# min_days_since_last_scrape=0 marks complete nodes as eligible again
+# min_days_since_last_scrape=0 re-queues complete nodes regardless of age
 scrapy crawl AmzRankings -a list_type=bestseller \
   -a categories="Office Products" -a min_days_since_last_scrape=0 \
   -s LOG_FILE=logs/amz_rankings_office_rescrape.log

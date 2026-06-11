@@ -4,16 +4,19 @@
 # thousands of nodes over many hours without restarting.
 #
 # Usage (from scraping/):
-#   .\run_rankings.ps1                                      # all categories, bestseller
-#   .\run_rankings.ps1 -ListType new_release                # all categories, new releases
-#   .\run_rankings.ps1 -StartFrom "Home & Kitchen"          # resume mid-list
-#   .\run_rankings.ps1 -Category "Pet Supplies"             # single category then stop
+#   .\run_rankings.ps1                                                   # all categories, bestseller
+#   .\run_rankings.ps1 -ListType new_release                             # all categories, new releases
+#   .\run_rankings.ps1 -StartFrom "Home & Kitchen"                       # resume mid-list
+#   .\run_rankings.ps1 -Category "Pet Supplies"                          # single category then stop
 #   .\run_rankings.ps1 -Category "Pet Supplies" -ListType new_release
+#   .\run_rankings.ps1 -Categories "Pet Supplies|Office Products"        # specific subset, pipe-delimited
+#   .\run_rankings.ps1 -Categories "Pet Supplies|Office Products" -ListType new_release
 
 param(
-    [string]$ListType  = "bestseller",
-    [string]$StartFrom = "",
-    [string]$Category  = ""
+    [string]$ListType   = "bestseller",
+    [string]$StartFrom  = "",
+    [string]$Category   = "",
+    [string]$Categories = ""
 )
 
 $categories = @(
@@ -48,6 +51,27 @@ if ($Category -ne "") {
         exit 1
     }
     Run-Category $Category $ListType
+    Write-Host ""
+    Write-Host "Done. Run merge_rankings.sql to promote staging -> transformed."
+    exit 0
+}
+
+# Subset mode — pipe-delimited list of categories
+if ($Categories -ne "") {
+    $subset = $Categories -split '\|' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
+    $invalid = $subset | Where-Object { $categories -notcontains $_ }
+    if ($invalid) {
+        Write-Host "ERROR: unknown categories: $($invalid -join ', '). Valid values:"
+        $categories | ForEach-Object { Write-Host "  $_" }
+        exit 1
+    }
+    foreach ($cat in $subset) {
+        Run-Category $cat $ListType
+        if ($subset[-1] -ne $cat) {
+            Write-Host "Finished: $cat -- waiting 90s before next category"
+            Start-Sleep -Seconds 90
+        }
+    }
     Write-Host ""
     Write-Host "Done. Run merge_rankings.sql to promote staging -> transformed."
     exit 0
