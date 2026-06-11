@@ -19,7 +19,7 @@ param(
     [string]$Categories = ""
 )
 
-$categories = @(
+$allCategories = @(
     "Arts, Crafts & Sewing",
     "Clothing, Shoes & Jewelry",
     "Handmade Products",
@@ -45,9 +45,9 @@ function Run-Category([string]$cat, [string]$listType) {
 
 # Single-category mode
 if ($Category -ne "") {
-    if ($categories -notcontains $Category) {
+    if ($allCategories -notcontains $Category) {
         Write-Host "ERROR: '$Category' not in category list. Valid values:"
-        $categories | ForEach-Object { Write-Host "  $_" }
+        $allCategories | ForEach-Object { Write-Host "  $_" }
         exit 1
     }
     Run-Category $Category $ListType
@@ -59,10 +59,10 @@ if ($Category -ne "") {
 # Subset mode — pipe-delimited list of categories
 if ($Categories -ne "") {
     $subset = $Categories -split '\|' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
-    $invalid = $subset | Where-Object { $categories -notcontains $_ }
+    $invalid = $subset | Where-Object { $allCategories -notcontains $_ }
     if ($invalid) {
         Write-Host "ERROR: unknown categories: $($invalid -join ', '). Valid values:"
-        $categories | ForEach-Object { Write-Host "  $_" }
+        $allCategories | ForEach-Object { Write-Host "  $_" }
         exit 1
     }
     foreach ($cat in $subset) {
@@ -80,7 +80,7 @@ if ($Categories -ne "") {
 # Full-list mode (with optional resume via -StartFrom)
 $skipping = $StartFrom -ne ""
 
-foreach ($cat in $categories) {
+foreach ($cat in $allCategories) {
     if ($skipping) {
         if ($cat -eq $StartFrom) { $skipping = $false } else { continue }
     }
