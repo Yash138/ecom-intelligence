@@ -94,6 +94,10 @@ If staging already contains two rows with the same merge key (e.g. two resume ru
 **P17 — Comma delimiter conflicts with category names that contain commas**
 Using `,` to delimit multiple categories in the `categories` spider parameter silently splits names like `"Arts, Crafts & Sewing"` into `["Arts", "Crafts & Sewing"]` — neither matches anything in the DB, the spider finds 0 nodes and exits cleanly with no error. Use `|` as the delimiter instead (`"Arts, Crafts & Sewing|Pet Supplies"`). Any parameter that accepts a list of values whose members may themselves contain the delimiter has this problem.
 
+**P18 — `wait_for_selector` times out on empty Amazon category pages**
+Some category nodes (e.g. "Scrapbooking Pens & Markers") have no bestsellers listed. Amazon serves a page with the message "Sorry, there are no Best Sellers available in this category." — no `div[data-asin]` is ever inserted into the DOM. `wait_for_selector('div[data-asin]')` waits the full 30s default timeout and then raises `TimeoutError`, failing the request. The node stays `in_progress` and is retried on every subsequent run forever.
+Fix: replace `wait_for_selector` with `wait_for_load_state('domcontentloaded')` — always completes immediately regardless of page content. Then in `parse()`, check for the empty-page message text and call `_mark_node_complete()` so the node is not retried.
+
 ## Running Spiders
 
 Always use the project venv — never the system Python:

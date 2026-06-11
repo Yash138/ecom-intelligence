@@ -417,7 +417,11 @@ class AmzRankingsSpider(scrapy.Spider):
         return {
             'playwright': True,
             'playwright_page_methods': [
-                PageMethod('wait_for_selector', 'div[data-asin]'),
+                # wait_for_load_state instead of wait_for_selector so we don't time out
+                # on empty-category pages ("Sorry, there are no Best Sellers available").
+                # The initial 30 products are in the DOM by domcontentloaded; scroll below
+                # triggers ACP lazy-load for items 31-50 on non-empty pages.
+                PageMethod('wait_for_load_state', 'domcontentloaded'),
                 PageMethod('evaluate', 'window.scrollTo(0, document.body.scrollHeight)'),
                 PageMethod('wait_for_timeout', 1500),   # ms — wait for lazy-load XHR
             ],
@@ -465,6 +469,14 @@ class AmzRankingsSpider(scrapy.Spider):
         products = self._extract_products(response, category, subcategory, subcategory_node_id)
 
         if not products:
+            if page == 1 and self._is_empty_category_page(response):
+                self.log(
+                    f"Empty category — Amazon has no listings for node={subcategory_node_id} "
+                    f"({category} / {subcategory}). Marking complete.",
+                    20,
+                )
+                self._mark_node_complete(category, subcategory)
+                return
             self.log(
                 f"WARNING: 0 products found on page {page} for node={subcategory_node_id}. "
                 "Selector may have changed. Dumping HTML to html_debug/.",
@@ -763,6 +775,20 @@ class AmzRankingsSpider(scrapy.Spider):
     # ------------------------------------------------------------------
     # Debug helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_empty_category_page(response) -> bool:
+        """
+        Returns True when Amazon serves the "no listings" page for a category node.
+        These pages contain a visible message and no product cards — they should be
+        marked complete (not retried) so the spider doesn't keep requeueing them.
+        """
+        body = response.text
+        return (
+            'no Best Sellers available in this category' in body
+            or 'no New Releases available in this category' in body
+            or 'no results available' in body.lower()
+        )
 
     def _dump_html(self, response, node_id: str, page: int):
         """Save response HTML to html_debug/ for selector debugging."""
