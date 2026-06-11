@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS transformed.amz_category_scrape_controller (
 --    Short-term buffer. Duplicates possible from resume scenarios.
 --    Promoted to transformed.amz_ranking via MERGE after each run.
 CREATE TABLE IF NOT EXISTS staging.amz_ranking_snapshot (
+    id                  UUID         NOT NULL DEFAULT gen_random_uuid(),
     run_id              UUID         NOT NULL,
     marketplace_id      VARCHAR(20)  NOT NULL REFERENCES transformed.marketplaces(marketplace_id),
     list_type           VARCHAR(20)  NOT NULL,
@@ -91,7 +92,7 @@ CREATE TABLE IF NOT EXISTS staging.amz_ranking_snapshot (
     price               NUMERIC(10,2),
     product_url         TEXT,                   -- raw href from page, ref params intact
     scraped_at          TIMESTAMP    NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (run_id, marketplace_id, list_type, subcategory_node_id, asin)
+    PRIMARY KEY (id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_ranking_snapshot_lookup
@@ -103,6 +104,7 @@ CREATE INDEX IF NOT EXISTS idx_ranking_snapshot_lookup
 --    Same ASIN can legitimately rank in multiple subcategories on the same day —
 --    subcategory_node_id is required in the key to preserve those distinct appearances.
 CREATE TABLE IF NOT EXISTS transformed.amz_ranking (
+    id                  UUID         NOT NULL DEFAULT gen_random_uuid(),
     marketplace_id      VARCHAR(20)  NOT NULL REFERENCES transformed.marketplaces(marketplace_id),
     list_type           VARCHAR(20)  NOT NULL,
     category            VARCHAR(100) NOT NULL,

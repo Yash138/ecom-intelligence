@@ -19,6 +19,7 @@
 | 2026-06-04 | §0.1–0.5, §5, §9, §12 | Phase 0 full design update: category hierarchy spider added as prerequisite; all table DDL finalized; schema layout defined (staging/transformed/monitoring/curated); HTML archiving + validation pipeline added; spider build order documented; data flow diagram updated; India spider analysis recorded |
 | 2026-06-04 | §5, §12 | Orchestration repo renamed `ecom-orchestration` → `orchestration`; scope changed to generic/multi-project with per-project folders + shared utilities; DAGs-last rule added |
 | 2026-06-04 | §0.4, §12 | Ranking data split into two layers: staging (raw append) + transformed (deduplicated via MERGE); dedup key defined as (marketplace_id, list_type, subcategory_node_id, asin, scrape_date); controller reset strategy (time-based, configurable N days) documented |
+| 2026-06-08 | §0.2, §12 | AmzRankings scrape scope corrected: all nodes scraped (root + intermediate + leaf), not leaf-only; controller seeded with all nodes; AmzProducts filters to leaf at query time via JOIN |
 
 ## Table of Contents
 
@@ -83,7 +84,7 @@ Get a ranked shortlist of 10–15 product candidates across the 10 categories in
 ```
 1. AmzCategoryHierarchy  →  transformed.amz_category + transformed.amz_category_hierarchy
                                         ↓
-2. Seeder SQL            →  transformed.amz_category_scrape_controller  (leaf nodes only)
+2. Seeder SQL            →  transformed.amz_category_scrape_controller  (ALL nodes — root + intermediate + leaf)
                                         ↓
 3. AmzRankings           →  staging.amz_ranking_snapshot  (bestseller + new_release)
                                         ↓
@@ -94,14 +95,18 @@ Get a ranked shortlist of 10–15 product candidates across the 10 categories in
 
 `AmzCategoryHierarchy` spider navigates the bestseller left-nav sidebar (same `role="treeitem"` structure as India `AmzCategoryUrls`) and writes directly to DB — no intermediate JSON file. Scoped to the 10 categories in `docs/chosen_categories.csv`. Populates two tables (see §0.4).
 
-**Step 3 — Rankings pages (10 categories, configurable depth):**
+**Step 3 — Rankings pages (10 categories, all depths):**
 
-`AmzRankings` spider accepts `list_type` param (`bestseller` or `new_release`). Reads pending entries from `amz_category_scrape_controller`. Depth is configurable via `DEPTH_LIMIT` setting.
+`AmzRankings` spider accepts `list_type` param (`bestseller` or `new_release`). Reads pending entries from `amz_category_scrape_controller`. Scrapes ranking pages at **every node level** — root, intermediate, and leaf — because Amazon exposes a distinct bestseller/new-release page for each node in the tree.
 
-| list_type | URL pattern | Products per run |
+| list_type | URL pattern | Products per node |
 |---|---|---|
-| `bestseller` | `amazon.com/bestsellers/<url_slug>` | up to 100 per leaf node |
-| `new_release` | `amazon.com/gp/new-releases/<url_slug>` | up to 100 per leaf node |
+| `bestseller` | `amazon.com/gp/bestsellers/<url_slug>/<node_id>` | up to 100 |
+| `new_release` | `amazon.com/gp/new-releases/<url_slug>/<node_id>` | up to 100 |
+
+**Controller is shared between AmzRankings and AmzProducts.** Both spiders read from `amz_category_scrape_controller`, but apply different filters at query time:
+- `AmzRankings` — reads all nodes (no `is_leaf` filter); scrapes every level
+- `AmzProducts` — filters to `is_leaf = TRUE` via JOIN to `amz_category`; only leaf-level product detail pages are needed
 
 **Fields captured from ranking pages (available without product detail fetch):**
 
@@ -1285,6 +1290,8 @@ All major decisions are closed. Recorded here for future reference.
 | Category hierarchy storage | **Closure table** (`amz_category_hierarchy`) | Replaces India's fixed `lvl1`…`lvl8` column approach. Any ancestor-descendant query is a simple join; no hard-coded depth limit; works regardless of how deep Amazon's tree goes. |
 | Category spider output | **Direct DB write** | India approach saved to JSON file → separate `parse_category_mapping.py` script to load. We write directly to `amz_category` + `amz_category_hierarchy` from the spider pipeline. Eliminates the intermediate file step. |
 | Ranking spider design | **Single `AmzRankings` spider with `list_type` param** | India had `AmzCategory` reading from a `.txt` URL file. We read from `amz_category_scrape_controller` and pass `list_type` as a parameter. One spider handles both bestseller and new_release. |
+| AmzRankings scrape scope | **All nodes — root, intermediate, and leaf** | Amazon exposes a distinct ranking page at every level of the category tree. Scraping only leaf nodes misses the aggregate views (e.g. "Dogs" bestsellers across all dog subcategories). AmzProducts differs — it only needs leaf-level product detail pages. |
+| Controller node scope | **All nodes seeded; spiders filter at query time** | `seed_controller.sql` seeds root + intermediate + leaf nodes. AmzRankings reads all. AmzProducts adds `AND cat.is_leaf = TRUE` via JOIN to `amz_category`. Keeps the controller as a single shared source of truth. |
 | `product_url` storage | **Raw href, ref params intact** | Constructed URLs (without Amazon's ref/navigation params) are easier for bot detection systems to identify. Store exactly what's on the page. Used by `AmzProducts` spider directly. |
 | `page_num` in ranking table | **Dropped** | Redundant — `rank_position` (1–100) already encodes position across both pagination pages. |
 | HTML archiving | **Gzipped HTML on local disk, 7-day retention** | Amazon's CSS/XPath selectors can change without warning. Archiving lets you re-parse with corrected selectors without re-scraping. ~40 KB/page compressed; ~1.4 GB/day at 35k ASINs. Pointer stored as `html_file_path` in snapshot tables. |

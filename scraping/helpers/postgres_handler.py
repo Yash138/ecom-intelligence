@@ -35,7 +35,7 @@ class PostgresDBHandler:
             cur.execute(query, tuple(data.values()))
         self.connection.commit()
 
-    def read(self, table=None, columns='*', conditions=None, query=None):
+    def read(self, table=None, columns='*', conditions=None, query=None, params=None):
         if not query:
             if isinstance(columns, list):
                 columns = ', '.join(columns)
@@ -43,7 +43,7 @@ class PostgresDBHandler:
             if conditions:
                 query += f" WHERE {conditions}"
         with self.connection.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(query)
+            cur.execute(query, params)
             return cur.fetchall()
 
     def stream_read(self, table=None, columns='*', conditions=None, query=None, batch_size=1000):
