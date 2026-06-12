@@ -332,6 +332,15 @@ class AmzRankingsSpider(scrapy.Spider):
                 params=(self.marketplace_id, self.list_type, matched_ids),
             )
             root_categories = [r['category'] for r in root_category_rows]
+
+            if not root_categories:
+                self.log(
+                    f"ERROR: matched nodes {matched_ids} have no rows in the scrape controller. "
+                    "Has seed_controller.sql been run? Run it before starting AmzRankings.",
+                    40,
+                )
+                return
+
             self.log(f"Category constraint resolved: {root_categories}", 20)
 
             node_id_filter_clause = (
@@ -429,11 +438,13 @@ class AmzRankingsSpider(scrapy.Spider):
         Playwright meta keys to merge into any Request that needs full page rendering.
 
         Flow once the browser loads the page:
-          1. wait_for_selector — confirms the initial 30 cards are in the DOM.
+          1. wait_for_load_state('domcontentloaded') — always resolves immediately,
+             whether or not product cards are present. Replaced wait_for_selector
+             which timed out on empty-category pages (P18).
           2. evaluate (scroll) — triggers the ACP widget's scroll event listener,
              which fires the lazy-load XHR for items 31-50.
-          3. wait_for_timeout — 3 seconds for the XHR to respond and the DOM to update
-             with the remaining cards before Scrapy reads the HTML.
+          3. wait_for_timeout — 1.5 seconds for the XHR to respond and the DOM to
+             update with the remaining cards before Scrapy reads the HTML.
 
         The resulting response.text contains all 50 product cards — no separate
         XHR request needed. _extract_products() selectors work unchanged.

@@ -14,6 +14,7 @@
 | 2026-06-07 | Maintenance Rules, Repo Structure, Feedback Log | Added scraping pitfalls reference; AmzCategoryHierarchy completed (8,782 nodes); current build status updated |
 | 2026-06-08 | Current State, First Thing to Build | AmzRankings spider built; scrape scope corrected to all nodes (not leaf-only); controller seeded with all nodes; AmzProducts filters leaf at query time |
 | 2026-06-09 | Current State, Repo Structure, Feedback Log | Playwright integration complete; AmzRankings now scrapes 100 products/node; `use_playwright` toggle added; venv noted |
+| 2026-06-13 | Current State, Maintenance Rules, Repo Structure, Feedback Log | Cross-category contamination (P19/P20/P21) found and fixed; all tables truncated; AmzCategoryHierarchy re-running; `validate_hierarchy.sql` added; bug count updated to 8; three additional code fixes applied (`_set_crawler`, docstring, empty root_categories log) |
 
 ## Table of Contents
 
@@ -43,11 +44,18 @@
 - Keep it dense — pointers and decisions only. Link to docs; don't reproduce them.
 - Log all dev errors and user corrections in the Feedback Log section.
 - **Doc convention (all documents):** Every doc must have `## Document Update History` (table: Date | Sections Changed | Summary) immediately after the title block, then `## Table of Contents` (anchor links, 2 levels) immediately below. Update the history table on every edit.
-- **MUST READ before building any spider:** `docs/scraping_pitfalls.md` — 7 bugs hit during AmzCategoryHierarchy development. These mistakes MUST be avoided at any cost.
+- **MUST READ before building any spider:** `docs/scraping_pitfalls.md` — 8 bugs hit during AmzCategoryHierarchy development (P1–P7 original + P21 shared slug collision found 2026-06-13). These mistakes MUST be avoided at any cost.
 
 ## Current State
 - **Old infra (exists, India):** Scrapy-based scraping of amazon.in → PostgreSQL (`ecommerce` DB). ~7.5 GB, 2.3M ASINs, 1 year history. Airflow + DockerOperator on local machine. Not being migrated — separate concern.
-- **New infra (Phase 0 in progress):** Amazon US scraping pipeline. `AmzCategoryHierarchy` spider complete — 8,782 category nodes across 10 target categories written to `ecom_intel` DB. `AmzRankings` spider built — scrapes all node levels (root + intermediate + leaf); controller seeded with all nodes; `AmzProducts` will filter to leaf nodes at query time. Next: validate selectors on live page, run AmzRankings, then build AmzProducts.
+- **New infra (Phase 0 — rescrape in progress as of 2026-06-13):** `AmzRankings` spider was built, run, and found to have cross-category data contamination from three bugs (P19/P20/P21 — see `scraping/CLAUDE.md`). All `ecom_intel` tables truncated 2026-06-13. `AmzCategoryHierarchy` is currently re-running from scratch.
+- **Next steps after hierarchy spider completes (run in this order):**
+  1. `psql -d ecom_intel -U ecom_intel_admin -f scraping/db/validate_hierarchy.sql` — all 6 checks must return 0 rows; if any fail, truncate and re-run the spider
+  2. `psql -d ecom_intel -U ecom_intel_admin -f scraping/db/seed_controller.sql`
+  3. `cd scraping && .\run_rankings.ps1` (bestseller, all categories)
+  4. `psql -d ecom_intel -U ecom_intel_admin -f scraping/db/merge_rankings.sql`
+  5. `cd scraping && .\run_rankings.ps1 -ListType new_release`
+  6. `psql -d ecom_intel -U ecom_intel_admin -f scraping/db/merge_rankings.sql`
 - **Active branch:** `infra_design`
 - **AmzRankings Playwright:** complete — scrapes 100 products/node (50/page × 2 pages). `use_playwright=false` for fast 60-product runs. Chromium installed at `C:\Users\yashl\AppData\Local\ms-playwright\chromium-1223`.
 
@@ -138,7 +146,7 @@ Jungle Scout / SellerApp = Truth Class D (estimates, store with `is_estimate=tru
 - `docs/old_infra/table_structure.md` — old India DB schema
 - `docs/old_infra/data_dictionary.md` — old India data dictionary
 - `docs/old_infra/epip_first_step_strategy.md` — strategy rationale for building category scoring first
-- `docs/scraping_pitfalls.md` — **MUST READ** — 7 hard bugs from AmzCategoryHierarchy; avoid at all costs in future spiders
+- `docs/scraping_pitfalls.md` — **MUST READ** — 8 bugs from AmzCategoryHierarchy (P1–P7 original + P21 shared slug collision); avoid at all costs in future spiders
 - `scraping/` — Scrapy project; flat layout (no package wrapper)
 
 ## Feedback / Error Log
@@ -147,3 +155,7 @@ Jungle Scout / SellerApp = Truth Class D (estimates, store with `is_estimate=tru
 - 2026-06-07 | AmzCategoryHierarchy | 7 bugs fixed — full details in `docs/scraping_pitfalls.md`
 - 2026-06-09 | venv | Always use `.venv_scrape` in repo root — never system Python or global pip
 - 2026-06-09 | AmzRankings | Playwright integration done; 100 products/node confirmed; `use_playwright` toggle added; docs: `scraping/docs/top_100_rankings_approach.md`, `scraping/docs/possible_enhancements.md`
+- 2026-06-13 | AmzRankings contamination | Three cross-category contamination bugs found and fixed: P19 (`_mark_node_complete` matched by subcategory name not node_id), P20 (closure table contamination allowed wrong categories into eligibility query), P21 (shared URL slug `/hi/` caused three root categories to overwrite same `amz_category` row). All `ecom_intel` tables truncated. Full bug details: `scraping/CLAUDE.md` P19–P21; P21 also in `docs/scraping_pitfalls.md`.
+- 2026-06-13 | validate_hierarchy.sql | New pre-seed validation script added (`scraping/db/validate_hierarchy.sql`). 6 checks. Must run after `AmzCategoryHierarchy`, before `seed_controller.sql`. All checks must return 0 rows before proceeding.
+- 2026-06-13 | run_rankings.ps1 | Added `-Categories` param (pipe-delimited subset of categories). Fixed `-Category` silent failure caused by PowerShell case-insensitive variable collision (`$Categories` param overwrote `$categories` array). Renamed internal array to `$allCategories`.
+- 2026-06-13 | Code fixes | (1) `AmzCategoryHierarchy.from_crawler()` now calls `_set_crawler(crawler)` instead of `spider.settings = crawler.settings` — P9 consistency. (2) `_playwright_meta()` docstring corrected to describe `wait_for_load_state` flow. (3) `AmzRankings.start()` now logs a clear error when `root_categories` is empty ("Has seed_controller.sql been run?") instead of the misleading "all nodes already scraped" message.

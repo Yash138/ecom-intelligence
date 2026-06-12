@@ -5,7 +5,7 @@
 Three spiders, run in order:
 
 1. **`AmzCategoryHierarchy`** — one-time. Scrapes Amazon's browse node tree → `transformed.amz_category` + `transformed.amz_category_hierarchy`. 8,782 nodes written. Complete.
-2. **`AmzRankings`** — scrapes bestseller/new-releases pages for all nodes. Reads pending nodes from `transformed.amz_category_scrape_controller`. Writes products to `raw.amz_rankings`.
+2. **`AmzRankings`** — scrapes bestseller/new-releases pages for all nodes. Reads pending nodes from `transformed.amz_category_scrape_controller`. Writes products to `staging.amz_ranking_snapshot`.
 3. **`AmzProducts`** — not yet built. Will scrape product detail pages for ASINs from `raw.amz_rankings`. Will filter to leaf nodes only at query time.
 
 ## Controller Pattern
@@ -62,7 +62,7 @@ When inspecting a new Amazon page for ACP attributes:
 
 **MUST READ before building any spider:** `docs/scraping_pitfalls.md` — 7 bugs from `AmzCategoryHierarchy` development.
 
-The pitfalls below (P8–P17) are from `AmzRankings` development. Apply to any future spider using Playwright or the controller pattern.
+The pitfalls below (P8–P21) are from `AmzRankings` development (P21 is an `AmzCategoryHierarchy` bug discovered during this work — also documented in `docs/scraping_pitfalls.md`). Apply to any future spider using Playwright or the controller pattern.
 
 **P8 — Amazon ACP lazy-loading**
 Never assume all items are in the static HTTP response. Amazon lazy-loads items 31–50 per page via ACP widget. Always dump raw HTML and count `div[data-asin]`. If count < expected, lazy loading is the cause. Fix: scrapy-playwright + scroll.
@@ -98,6 +98,19 @@ Using `,` to delimit multiple categories in the `categories` spider parameter si
 Some category nodes (e.g. "Scrapbooking Pens & Markers") have no bestsellers listed. Amazon serves a page with the message "Sorry, there are no Best Sellers available in this category." — no `div[data-asin]` is ever inserted into the DOM. `wait_for_selector('div[data-asin]')` waits the full 30s default timeout and then raises `TimeoutError`, failing the request. The node stays `in_progress` and is retried on every subsequent run forever.
 Fix: replace `wait_for_selector` with `wait_for_load_state('domcontentloaded')` — always completes immediately regardless of page content. Then in `parse()`, check for the empty-page message text and call `_mark_node_complete()` so the node is not retried.
 
+**P19 — `_mark_node_complete()` matched by (category, subcategory) name, not node_id**
+Original implementation filtered by `category = %s AND subcategory = %s` (display names). Subcategory names repeat across root categories — e.g. "Storage" appears under both Home & Kitchen and Tools & Home Improvement. Any UPDATE using name columns matches every row with that subcategory name across all categories, silently marking nodes complete in the wrong category's run.
+Fix: filter by `subcategory_node_id = %s`. node_id is unique per node. Both call sites in `parse()` (normal completion and empty-page completion) were updated to pass `subcategory_node_id`.
+
+**P20 — Closure table cross-contamination causes eligibility query to queue wrong categories**
+`AmzRankings.start()` expands a named category to all descendants via the closure table (`amz_category_hierarchy`). If the hierarchy spider attributed nodes from another category to the wrong root (e.g. because of shared URL slug traversal — see P21), the expansion returns node_ids that belong to a different top-level category. Without a category constraint, the eligibility query queues and scrapes those foreign nodes during the wrong category's run.
+Fix: after expanding `matched_ids` to `target_ids` via the closure table, resolve the correct root categories by querying `amz_category_scrape_controller` directly on `matched_ids` (not the expanded set). This uses the controller's own `category` column — which was set correctly at seed time from the category name — and adds `AND ctrl.category = ANY(root_categories)` to the eligibility query. The closure table is used only for ID expansion, not for category attribution.
+
+**P21 — Shared URL slug causes root category node_id collision in AmzCategoryHierarchy**
+`_node_id(url)` returns the URL slug for root nodes (no numeric ID in the URL). Multiple root categories share the same slug: Home & Kitchen, Kitchen & Dining, and Tools & Home Improvement all resolve to `/hi/`. All three call `_write_node(node_id='hi', ...)` — each overwrites the previous row in `amz_category`. After the spider completes, only one root survives in the DB. `seed_controller.sql` then finds that root's subtree and assigns all nodes under it to a single category name, corrupting the controller for all three categories.
+Fix: in `parse_root()`, use `node_id = name` (the display category name) instead of `_node_id(url)`. Category names are unique across all 10 target categories and fit within VARCHAR(30). Companion fix: `_build_url()` now checks `node_id.isdigit()` to determine whether to append the node_id to the URL — string (root) node_ids do not appear in the URL, only numeric subcategory IDs do.
+Always run `validate_hierarchy.sql` after `AmzCategoryHierarchy` to detect this class of collision before seeding the controller.
+
 ## Running Spiders
 
 Always use the project venv — never the system Python:
@@ -126,3 +139,4 @@ Playwright Chromium is installed at: `C:\Users\yashl\AppData\Local\ms-playwright
 - `docs/top_100_rankings_approach.md` — plan to reach 100 products/node via Playwright
 - `docs/sanity_checks.md` — SQL queries for verifying DB state
 - `docs/explainations.md` — closure table explanation for `amz_category_hierarchy`
+- `db/validate_hierarchy.sql` — 6 integrity checks; run after AmzCategoryHierarchy, before seed_controller.sql; all checks must return 0 rows

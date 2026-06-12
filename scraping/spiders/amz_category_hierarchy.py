@@ -56,7 +56,7 @@ class AmzCategoryHierarchySpider(scrapy.Spider):
     @classmethod
     def from_crawler(cls, crawler, *args, **kwargs):
         spider = cls(*args, **kwargs)
-        spider.settings = crawler.settings
+        spider._set_crawler(crawler)   # sets spider.crawler + spider.settings (Scrapy 2.16 API — see P9)
         spider.target_categories = [c.lower() for c in crawler.settings.get('TARGET_CATEGORIES', [])]
         spider.db = PostgresDBHandler(
             host=crawler.settings.get('POSTGRES_HOST'),

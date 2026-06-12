@@ -5,6 +5,7 @@
 | Date | Sections Changed | Summary |
 |---|---|---|
 | 2026-06-07 | All | Initial creation — 6 hard bugs hit during AmzCategoryHierarchy development |
+| 2026-06-13 | TOC, P21 | Added P21 — shared URL slug root node_id collision; discovered during AmzRankings contamination investigation |
 
 ## Table of Contents
 
@@ -15,6 +16,7 @@
 - [P5 — psycopg2 aborted transaction cascade](#p5--psycopg2-aborted-transaction-cascade)
 - [P6 — ON CONFLICT cardinality violation in batch upserts](#p6--on-conflict-cardinality-violation-in-batch-upserts)
 - [P7 — pkill does not work on Windows](#p7--pkill-does-not-work-on-windows)
+- [P21 — Shared URL slug causes root node_id collision](#p21--shared-url-slug-causes-root-node-id-collision)
 
 ---
 
@@ -155,3 +157,35 @@ wmic process where "commandline like '%AmzCategoryHierarchy%' and name like '%py
 Or use Task Manager → Details tab → kill `python.exe` / `scrapy.exe` processes.
 
 **Rule: Never use `pkill` in runbooks or scripts targeting Windows. Document Windows-specific kill commands explicitly.**
+
+---
+
+## P21 — Shared URL slug causes root node_id collision
+
+**Symptom:** After running `AmzCategoryHierarchy`, running `AmzRankings` for a single category (e.g. Tools & Home Improvement) also scrapes nodes from other categories (e.g. Kitchen & Dining, Home & Kitchen). `amz_category_scrape_controller` assigns subcategories from multiple roots to a single category name. All three categories show today's `last_scraped_at` even though only one was requested.
+
+**Cause:** `_node_id(url)` returns the URL slug for root-level URLs (no numeric ID in the path). Amazon assigns the same slug `/hi/` to Home & Kitchen, Kitchen & Dining, and Tools & Home Improvement. All three roots call `_write_node(node_id='hi', node_name=..., ...)` — each overwrites the previous row in `amz_category`. The spider completes with only one root row surviving. `seed_controller.sql` then joins via the closure table and assigns all subcategories under the shared slug to that single root's category name, corrupting the controller for all three categories.
+
+**Fix in `AmzCategoryHierarchy.parse_root()`:** Use the category display name as node_id instead of `_node_id(url)`:
+```python
+# WRONG — returns URL slug 'hi' for all three shared-slug categories
+node_id = self._node_id(url)
+
+# CORRECT — category name is unique across all 10 targets and fits VARCHAR(30)
+node_id = name
+```
+
+**Companion fix in `AmzRankings._build_url()`:** The URL construction check must use `isdigit()` not `node_id == url_slug`. String root node_ids (category names like "Home & Kitchen") do not appear in the URL — only numeric subcategory IDs do:
+```python
+# WRONG — fails when node_id is 'Home & Kitchen' (not equal to url_slug 'hi')
+if node_id == url_slug:
+    return f'{base}/{url_slug}'
+return f'{base}/{url_slug}/{node_id}'
+
+# CORRECT
+if node_id.isdigit():
+    return f'{base}/{url_slug}/{node_id}'
+return f'{base}/{url_slug}'
+```
+
+**Rule: Never use `_node_id(url)` (slug-based ID) for root nodes. Root node_ids must be unique across all target categories regardless of shared URL slug. Always run `validate_hierarchy.sql` CHECK 3 after `AmzCategoryHierarchy` to detect this collision before seeding the controller.**
