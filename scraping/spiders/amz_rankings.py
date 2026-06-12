@@ -791,9 +791,14 @@ class AmzRankingsSpider(scrapy.Spider):
         else:
             base = 'https://www.amazon.com/gp/new-releases'
 
-        if node_id == url_slug:
-            return f'{base}/{url_slug}'
-        return f'{base}/{url_slug}/{node_id}'
+        # Subcategory nodes have numeric Amazon browse node IDs (e.g. '552854').
+        # Root category nodes have string node_ids (the category name, e.g. 'Home & Kitchen')
+        # because multiple root categories can share the same URL slug and the slug
+        # alone cannot uniquely identify them in the DB.
+        # Only numeric node_ids appear in the URL.
+        if node_id.isdigit():
+            return f'{base}/{url_slug}/{node_id}'
+        return f'{base}/{url_slug}'
 
     # ------------------------------------------------------------------
     # Debug helpers

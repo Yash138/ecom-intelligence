@@ -112,10 +112,19 @@ class AmzCategoryHierarchySpider(scrapy.Spider):
                 continue
             self.visited_urls.add(url)
 
-            node_id = self._node_id(url)
-            self.visited_node_ids.add(node_id)
             url_slug = self._slug(url)
             self.target_slugs.add(url_slug)         # record slugs we're allowed to crawl
+
+            # Use the category name as node_id for root nodes.
+            # _node_id() returns the URL slug (e.g. 'hi') for root categories that have
+            # no numeric ID in the URL. Multiple root categories can share the same slug
+            # (Home & Kitchen, Kitchen & Dining, and Tools & Home Improvement all use /hi/).
+            # Using the slug as node_id means all three overwrite the same row in
+            # amz_category, leaving a single contaminated root that seed_controller.sql
+            # then attributes to all their subcategories incorrectly.
+            # The category name is unique across our 10 target categories and fits VARCHAR(30).
+            node_id = name
+            self.visited_node_ids.add(node_id)
 
             self.log(f"Root category found: '{name}' → node_id={node_id}, slug={url_slug}", 20)
 
