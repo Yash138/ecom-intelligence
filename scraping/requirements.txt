@@ -1,0 +1,17 @@
+# python version: 3.12
+
+# Core scraping
+scrapy>=2.11.0
+scrapy-user-agents>=0.1.1
+scrapy-playwright>=0.0.40
+playwright-stealth>=1.0.6         # not active yet — see docs/possible_enhancements.md
+
+# Database
+psycopg2-binary>=2.9.0
+
+# Config / env
+python-dotenv>=1.0.0
+
+# Analysis / notebooks
+pandas
+ipykernel
