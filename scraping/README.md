@@ -352,10 +352,28 @@ WHERE marketplace_id = 'amazon_us' GROUP BY list_type, scrape_status ORDER BY li
 
 ```
 1. AmzCategoryHierarchy          (once per market)
-2. seed_controller.sql           (once, after hierarchy spider)
-3. AmzRankings list_type=bestseller
-4. AmzRankings list_type=new_release
-5. merge_rankings.sql            (after each rankings run)
+2. validate_hierarchy.sql        (MUST pass all checks before proceeding)
+3. seed_controller.sql           (once, after hierarchy spider)
+4. AmzRankings list_type=bestseller
+5. AmzRankings list_type=new_release
+6. merge_rankings.sql            (after each rankings run)
+```
+
+### validate_hierarchy.sql — checks and what they catch
+
+| Check | What it catches |
+|---|---|
+| 1 — Root node count = 10 | Spider missed target categories on root page |
+| 2 — All 10 categories present | Same as above, but names the missing ones |
+| 3 — No shared root node_ids | Multiple root categories overwriting each other (shared URL slug bug) |
+| 4 — No node under multiple roots | Closure table cross-contamination — node attributed to wrong category |
+| 5 — Every node reachable from a root | Orphaned nodes that seed_controller would skip entirely |
+| 6 — Every node has self-reference row | Incomplete closure records — seed_controller JOIN would miss nodes |
+
+All checks must return 0 rows. The summary at the end shows node counts per category — any category with suspiciously low counts (e.g. 0 leaf nodes) indicates traversal contamination even if individual checks pass.
+
+```bash
+psql -d ecom_intel -U ecom_intel_admin -f db/validate_hierarchy.sql
 ```
 
 ---
