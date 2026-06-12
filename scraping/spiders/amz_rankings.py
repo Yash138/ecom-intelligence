@@ -314,8 +314,32 @@ class AmzRankingsSpider(scrapy.Spider):
                 self.log("No eligible leaf nodes after category resolution. Exiting.", 30)
                 return
 
-            node_id_filter_clause = "AND ctrl.subcategory_node_id = ANY(%(target_ids)s)"
+            # Constrain to only nodes whose controller.category belongs to the same
+            # top-level categories as the matched nodes. This guards against closure
+            # table cross-contamination: multiple top-level categories (e.g. Tools &
+            # Home Improvement, Home & Kitchen, Kitchen & Dining) share the same Amazon
+            # URL slug (/hi/), so AmzCategoryHierarchy may have recorded nodes from
+            # other categories as descendants of the requested one. Without this
+            # constraint the eligibility query would queue nodes from wrong categories.
+            root_category_rows = self.db.read(
+                query="""
+                    SELECT DISTINCT category
+                    FROM transformed.amz_category_scrape_controller
+                    WHERE marketplace_id      = %s
+                      AND list_type           = %s
+                      AND subcategory_node_id = ANY(%s)
+                """,
+                params=(self.marketplace_id, self.list_type, matched_ids),
+            )
+            root_categories = [r['category'] for r in root_category_rows]
+            self.log(f"Category constraint resolved: {root_categories}", 20)
+
+            node_id_filter_clause = (
+                "AND ctrl.subcategory_node_id = ANY(%(target_ids)s) "
+                "AND ctrl.category = ANY(%(root_categories)s)"
+            )
             filter_params['target_ids'] = target_ids
+            filter_params['root_categories'] = root_categories
 
         # ------------------------------------------------------------------
         # Step 2: load eligible rows from the controller
