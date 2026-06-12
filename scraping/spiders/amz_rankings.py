@@ -475,7 +475,7 @@ class AmzRankingsSpider(scrapy.Spider):
                     f"({category} / {subcategory}). Marking complete.",
                     20,
                 )
-                self._mark_node_complete(category, subcategory)
+                self._mark_node_complete(subcategory_node_id)
                 return
             self.log(
                 f"WARNING: 0 products found on page {page} for node={subcategory_node_id}. "
@@ -510,7 +510,7 @@ class AmzRankingsSpider(scrapy.Spider):
                 errback=self.handle_error,
             )
         else:
-            self._mark_node_complete(category, subcategory)
+            self._mark_node_complete(subcategory_node_id)
 
     def handle_error(self, failure):
         """Log request errors (main page). Node stays in_progress for retry on next run."""
@@ -684,19 +684,18 @@ class AmzRankingsSpider(scrapy.Spider):
         )
         self.products_written += len(deduped)
 
-    def _mark_node_complete(self, category: str, subcategory: str):
-        """Mark a leaf node as complete in the scrape controller."""
+    def _mark_node_complete(self, subcategory_node_id: str):
+        """Mark a node as complete in the scrape controller."""
         self.db.execute(
             """
             UPDATE transformed.amz_category_scrape_controller
-            SET scrape_status  = 'complete',
+            SET scrape_status   = 'complete',
                 last_scraped_at = NOW()
-            WHERE marketplace_id = %s
-              AND list_type      = %s
-              AND category       = %s
-              AND subcategory    = %s
+            WHERE marketplace_id      = %s
+              AND list_type           = %s
+              AND subcategory_node_id = %s
             """,
-            (self.marketplace_id, self.list_type, category, subcategory),
+            (self.marketplace_id, self.list_type, subcategory_node_id),
         )
         self.nodes_completed += 1
 
