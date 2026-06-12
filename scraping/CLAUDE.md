@@ -111,6 +111,47 @@ Fix: after expanding `matched_ids` to `target_ids` via the closure table, resolv
 Fix: in `parse_root()`, use `node_id = name` (the display category name) instead of `_node_id(url)`. Category names are unique across all 10 target categories and fit within VARCHAR(30). Companion fix: `_build_url()` now checks `node_id.isdigit()` to determine whether to append the node_id to the URL — string (root) node_ids do not appear in the URL, only numeric subcategory IDs do.
 Always run `validate_hierarchy.sql` after `AmzCategoryHierarchy` to detect this class of collision before seeding the controller.
 
+## New Spider Development Process
+
+Follow this sequence every time. Do not skip steps — most selector bugs and wasted development time come from skipping steps 1–4.
+
+**Step 1 — Define what to scrape**
+Before writing a line of code, ask: what fields are needed? Agree on the exact attribute list (field name, type, nullable or not, example value). Do not start development without this — selectors found for the wrong fields waste hours.
+
+**Step 2 — Set expectations**
+Agree on: target page URL pattern, expected record count per page/node, any known Amazon restrictions (login walls, bot detection, lazy-loading). Document assumptions before they become surprises mid-build.
+
+**Step 3 — Download the raw HTML**
+Save the actual target page to disk before writing any selectors:
+```bash
+# Using scrapy fetch (respects middleware settings)
+scrapy fetch "https://www.amazon.com/..." > html_debug/target_page.html
+
+# Or via curl (no middleware)
+curl -A "Mozilla/5.0..." "https://www.amazon.com/..." -o html_debug/target_page.html
+```
+Never write selectors by reading the live page in a browser — what you see is rendered JS; what Scrapy receives is the raw HTTP response and they differ significantly on Amazon.
+
+**Step 4 — Analyse the HTML and write selectors offline**
+Open the saved HTML file, identify the exact elements and attributes for each field. Write down the CSS selector or XPath for each. Check for Amazon's hashed class names — always use substring selectors (`[class*="..."]`), never exact class names (P3).
+
+**Step 5 — Validate selectors in Scrapy shell against a live page**
+```bash
+# From scraping/
+D:/Documents/projects/GitHub/ecom-intelligence/.venv_scrape/Scripts/scrapy shell "https://www.amazon.com/..."
+
+# Inside shell — test each selector before trusting it
+response.css('div[data-asin]')              # card count
+response.css('div[data-asin]').get()        # first card HTML
+response.css('[class*="zg-bdg-text"]::text').getall()   # rank badges
+```
+A selector that works on the saved HTML but returns nothing in the shell means Amazon serves different markup to Scrapy — add headers, check JS rendering requirements, or switch to Playwright.
+
+**Step 6 — Build the spider**
+Only after steps 1–5 are done. Selectors are confirmed; no guessing during development.
+
+---
+
 ## Running Spiders
 
 Always use the project venv — never the system Python:
