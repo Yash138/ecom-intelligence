@@ -103,7 +103,8 @@ run the merge script afterwards to promote to transformed.
 
 Scrapes ranking pages at **every node level** — root, intermediate, and leaf.
 Amazon exposes a distinct page for each node; all levels are scraped.
-`AmzProducts` (future) uses the same controller but filters to leaf nodes only at query time.
+`AmzProducts` reads the resulting ASINs from the queue seeded by `seed_product_queue.sql`
+(no is_leaf filter — all ranked ASINs are scraped regardless of node depth).
 
 **Product coverage:**
 - `use_playwright=true` (default) — **~100 products/node** (50/page × 2 pages). Playwright scrolls the page to trigger Amazon's lazy-load for items 31-50 before Scrapy reads the HTML.
@@ -350,8 +351,12 @@ WHERE marketplace_id = 'amazon_us' GROUP BY list_type, scrape_status ORDER BY li
 
 ## Spider 3 — AmzProducts
 
-Reads leaf-node ASINs from `transformed.amz_product_scrape_queue`, scrapes the
-product detail page for each, and writes a snapshot to `staging.amz_product_snapshot`.
+Reads ASINs from `transformed.amz_product_scrape_queue`, scrapes the product detail
+page for each, and writes a snapshot to `staging.amz_product_snapshot`.
+
+The queue is seeded from `transformed.amz_ranking` with no `is_leaf` filter — all
+ranked ASINs are included regardless of node depth, because AmzRankings scrapes
+root, intermediate, and leaf nodes and all may produce valid products.
 
 - Requires Playwright — sets zip 19901 via the Amazon location popover before
   loading any product pages (required for buybox fields: price, seller, is_fba).
@@ -486,11 +491,11 @@ WHERE asin = 'B0BZYCJK89';
 10. validate_product_run.sql         (MUST pass — all checks return 0 rows)
 ```
 
-Full sequence as copy-paste commands (run from `scraping/`):
+Full sequence as copy-paste commands (run from `scraping/` in PowerShell):
 
-```bash
+```powershell
 # 1. Category hierarchy
-scrapy crawl AmzCategoryHierarchy -a marketplace_id=amazon_us \
+scrapy crawl AmzCategoryHierarchy -a marketplace_id=amazon_us `
   -s LOG_FILE=logs/amz_category_hierarchy.log
 
 # 2. Validate hierarchy (all 6 checks must return 0 rows)
@@ -511,7 +516,7 @@ psql -d ecom_intel -U ecom_intel_admin -f db/merge_rankings.sql
 psql -d ecom_intel -U ecom_intel_admin -f db/seed_product_queue.sql
 
 # 9. Scrape product pages
-scrapy crawl AmzProducts -a marketplace_id=amazon_us \
+scrapy crawl AmzProducts -a marketplace_id=amazon_us `
   -s LOG_FILE=logs/amz_products.log
 
 # 10. Validate product run
