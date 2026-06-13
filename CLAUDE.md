@@ -15,6 +15,7 @@
 | 2026-06-08 | Current State, First Thing to Build | AmzRankings spider built; scrape scope corrected to all nodes (not leaf-only); controller seeded with all nodes; AmzProducts filters leaf at query time |
 | 2026-06-09 | Current State, Repo Structure, Feedback Log | Playwright integration complete; AmzRankings now scrapes 100 products/node; `use_playwright` toggle added; venv noted |
 | 2026-06-13 | Current State, Maintenance Rules, Repo Structure, Feedback Log | Cross-category contamination (P19/P20/P21) found and fixed; all tables truncated; AmzCategoryHierarchy re-running; `validate_hierarchy.sql` added; bug count updated to 8; three additional code fixes applied (`_set_crawler`, docstring, empty root_categories log) |
+| 2026-06-13 | Current State, First Thing to Build, Repo Structure, Feedback Log | AmzProducts spider built; DDL §8a+8b added; `seed_product_queue.sql` created; `items.py` updated; selectors validated against rendered HTML; P22 documented |
 
 ## Table of Contents
 
@@ -44,7 +45,7 @@
 - Keep it dense — pointers and decisions only. Link to docs; don't reproduce them.
 - Log all dev errors and user corrections in the Feedback Log section.
 - **Doc convention (all documents):** Every doc must have `## Document Update History` (table: Date | Sections Changed | Summary) immediately after the title block, then `## Table of Contents` (anchor links, 2 levels) immediately below. Update the history table on every edit.
-- **MUST READ before building any spider:** `docs/scraping_pitfalls.md` — 8 bugs hit during AmzCategoryHierarchy development (P1–P7 original + P21 shared slug collision found 2026-06-13). These mistakes MUST be avoided at any cost.
+- **MUST READ before building any spider:** `docs/scraping_pitfalls.md` (P1–P7, P21 from AmzCategoryHierarchy) + `scraping/CLAUDE.md` Key Pitfalls (P8–P22 from AmzRankings/AmzProducts). These mistakes MUST be avoided at any cost.
 
 ## Current State
 - **Old infra (exists, India):** Scrapy-based scraping of amazon.in → PostgreSQL (`ecommerce` DB). ~7.5 GB, 2.3M ASINs, 1 year history. Airflow + DockerOperator on local machine. Not being migrated — separate concern.
@@ -56,6 +57,9 @@
   4. `psql -d ecom_intel -U ecom_intel_admin -f scraping/db/merge_rankings.sql`
   5. `cd scraping && .\run_rankings.ps1 -ListType new_release`
   6. `psql -d ecom_intel -U ecom_intel_admin -f scraping/db/merge_rankings.sql`
+  7. `psql -d ecom_intel -U ecom_intel_admin -f scraping/db/seed_product_queue.sql`
+  8. `cd scraping && .venv_scrape/Scripts/scrapy crawl AmzProducts -a marketplace_id=amazon_us`
+- **`AmzProducts` spider is built** (2026-06-13). Reads from `transformed.amz_product_scrape_queue`, writes to `staging.amz_product_snapshot`. Requires Playwright + zip 19901 for buybox fields. Design in `scraping/CLAUDE.md` § AmzProducts Design Decisions.
 - **Active branch:** `infra_design`
 - **AmzRankings Playwright:** complete — scrapes 100 products/node (50/page × 2 pages). `use_playwright=false` for fast 60-product runs. Chromium installed at `C:\Users\yashl\AppData\Local\ms-playwright\chromium-1223`.
 
@@ -146,8 +150,11 @@ Jungle Scout / SellerApp = Truth Class D (estimates, store with `is_estimate=tru
 - `docs/old_infra/table_structure.md` — old India DB schema
 - `docs/old_infra/data_dictionary.md` — old India data dictionary
 - `docs/old_infra/epip_first_step_strategy.md` — strategy rationale for building category scoring first
-- `docs/scraping_pitfalls.md` — **MUST READ** — 8 bugs from AmzCategoryHierarchy (P1–P7 original + P21 shared slug collision); avoid at all costs in future spiders
+- `docs/scraping_pitfalls.md` — **MUST READ** — P1–P7 + P21 from AmzCategoryHierarchy; P8–P22 in `scraping/CLAUDE.md`
 - `scraping/` — Scrapy project; flat layout (no package wrapper)
+- `scraping/spiders/amz_products.py` — AmzProducts spider (built 2026-06-13)
+- `scraping/db/seed_product_queue.sql` — manual seeder for product queue; run after each rankings merge cycle
+- `scraping/db/ddl.sql` — full schema including §8a (queue) + §8b (product snapshot)
 
 ## Feedback / Error Log
 <!-- Format: YYYY-MM-DD | context | what went wrong or was corrected -->
@@ -159,3 +166,4 @@ Jungle Scout / SellerApp = Truth Class D (estimates, store with `is_estimate=tru
 - 2026-06-13 | validate_hierarchy.sql | New pre-seed validation script added (`scraping/db/validate_hierarchy.sql`). 6 checks. Must run after `AmzCategoryHierarchy`, before `seed_controller.sql`. All checks must return 0 rows before proceeding.
 - 2026-06-13 | run_rankings.ps1 | Added `-Categories` param (pipe-delimited subset of categories). Fixed `-Category` silent failure caused by PowerShell case-insensitive variable collision (`$Categories` param overwrote `$categories` array). Renamed internal array to `$allCategories`.
 - 2026-06-13 | Code fixes | (1) `AmzCategoryHierarchy.from_crawler()` now calls `_set_crawler(crawler)` instead of `spider.settings = crawler.settings` — P9 consistency. (2) `_playwright_meta()` docstring corrected to describe `wait_for_load_state` flow. (3) `AmzRankings.start()` now logs a clear error when `root_categories` is empty ("Has seed_controller.sql been run?") instead of the misleading "all nodes already scraped" message.
+- 2026-06-13 | AmzProducts built | Spider built; 20 fields; Playwright + zip 19901 for buybox; delete-on-success queue; SCD2 timestamps; monitoring stats. Fixed selectors: `#bylineInfo` is `<a>` not container; `th.prodDetSectionEntry` is on `<th>` not `<tr>`; `networkidle` times out (P22). Validated on catchmaster + BubbleBlooms rendered HTML.

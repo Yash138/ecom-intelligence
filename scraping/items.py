@@ -30,6 +30,33 @@ class AmzRankingItem(scrapy.Item):
 
 
 class AmzProductItem(scrapy.Item):
-    # Schema TBD — populated when AmzProducts spider is built
-    asin = scrapy.Field()
+    # identity
     marketplace_id = scrapy.Field()
+    asin = scrapy.Field()
+    # static fields
+    title = scrapy.Field()
+    brand = scrapy.Field()
+    main_image_url = scrapy.Field()
+    launch_date = scrapy.Field()         # raw text, e.g. "January 1, 2023"
+    about_this_item = scrapy.Field()     # newline-delimited bullets
+    # volatile fields
+    rating = scrapy.Field()
+    review_count = scrapy.Field()
+    rating_breakdown = scrapy.Field()    # dict: {"5": 63, "4": 12, ...}
+    bsr_entries = scrapy.Field()         # list: [{"rank": 360, "category": "..."}]
+    last_month_sales = scrapy.Field()    # raw text, e.g. "100+" or "1K+"
+    # JS-rendered fields (Playwright + zip 19901)
+    price = scrapy.Field()
+    seller_name = scrapy.Field()
+    seller_id = scrapy.Field()
+    is_fba = scrapy.Field()
+    # variant and related products
+    has_variants = scrapy.Field()
+    variant_asins = scrapy.Field()       # list of ASINs
+    related_asins = scrapy.Field()       # list of ASINs
+    # product attributes (sparse)
+    weight = scrapy.Field()
+    dimensions = scrapy.Field()
+    # metadata
+    is_small_business = scrapy.Field()
+    html_file_path = scrapy.Field()

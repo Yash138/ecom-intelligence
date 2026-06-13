@@ -6,7 +6,99 @@ Three spiders, run in order:
 
 1. **`AmzCategoryHierarchy`** — one-time. Scrapes Amazon's browse node tree → `transformed.amz_category` + `transformed.amz_category_hierarchy`. 8,782 nodes written. Complete.
 2. **`AmzRankings`** — scrapes bestseller/new-releases pages for all nodes. Reads pending nodes from `transformed.amz_category_scrape_controller`. Writes products to `staging.amz_ranking_snapshot`.
-3. **`AmzProducts`** — not yet built. Will scrape product detail pages for ASINs from `raw.amz_rankings`. Will filter to leaf nodes only at query time.
+3. **`AmzProducts`** — **built 2026-06-13.** Scrapes product detail pages for ASINs from `transformed.amz_product_scrape_queue`. Writes to `staging.amz_product_snapshot`.
+
+## AmzProducts — Design Decisions
+
+### Source of ASINs
+Queue table `transformed.amz_product_scrape_queue`. Seeded via `db/seed_product_queue.sql`.
+
+**No `is_leaf` filter** on queue seeding — `AmzRankings` scrapes all node levels (root + intermediate + leaf), so filtering to `is_leaf=TRUE` would silently exclude valid ASINs. Seed query uses `DISTINCT ON (marketplace_id, asin)` over `transformed.amz_ranking` with no category join.
+
+### Queue Table Design
+`transformed.amz_product_scrape_queue` (DDL: `db/ddl.sql` §8a):
+- **Delete-on-success** pattern: row deleted after confirmed scrape + DB write.
+- **No scrape_status column**: job is either pending (in queue) or done (deleted).
+- Variant ASINs discovered during scraping are inserted (`ON CONFLICT DO NOTHING`).
+- `added_at` timestamp for ordering and debugging.
+
+### Product Snapshot Table
+`staging.amz_product_snapshot` (DDL: `db/ddl.sql` §8b):
+- One row per `(marketplace_id, asin)`. UPSERT semantics.
+- `first_captured_at` — set on INSERT, **never updated** (SCD2 foundation).
+- `last_captured_at` — updated on every re-scrape.
+- No transformation in staging: all fields stored as raw text/values. Type conversion happens in the transformed layer.
+
+### Zip Code / Buybox Setup
+Zip code `19901` must be set before product pages load. Without it Amazon geo-blocks and the buybox (price, seller_name, seller_id, is_fba) does not render.
+
+Implementation: **bootstrap request** to `amazon.com` before any product pages:
+1. `start()` yields one request to `amazon.com` with `PageMethod` steps for the location popover.
+2. Cookies with zip preference persist to all subsequent product pages in the same Playwright context.
+3. Product queue is loaded from DB and yielded in the bootstrap callback `_load_product_queue()` — guarantees zip is set before any product page is requested.
+
+Popover flow:
+```python
+PageMethod('click', '#glow-ingress-block'),
+PageMethod('fill', '#GLUXZipUpdateInput', '19901'),
+PageMethod('click', 'span#GLUXZipUpdate input.a-button-input'),
+```
+
+### Fields and Selectors (confirmed 2026-06-13)
+
+**Static** (always present in plain HTTP response):
+
+| Field | Selector / Method |
+|---|---|
+| `title` | `#productTitle::text` — strip whitespace |
+| `rating` | `span.a-icon-alt::text` → regex `(\d+\.?\d*)` |
+| `review_count` | `#acrCustomerReviewText::text` → strip `()`, remove commas |
+| `brand` | `#bylineInfo::text` → regex `Visit the (.+?) Store` or strip `Brand: ` prefix |
+| `main_image_url` | `#landingImage::attr(data-a-dynamic-image)` → JSON, key with largest area |
+| `bsr_entries` | `th.prodDetSectionEntry` → filter "Best Sellers Rank" → `xpath('../td')` → `li.xpath('string()')` → regex `#([\d,]+)\s+in\s+(.+?)(?:\s*\(See\b\|$)` |
+| `last_month_sales` | xpath `//*[contains(text(), "bought in past month")]` → regex `([\d,K+]+)\s+bought in past month` |
+| `has_variants` | `[id*="inline-twister"]` — presence check |
+| `is_small_business` | `[id*="sbe_badge"]` — presence check |
+| `about_this_item` | `#feature-bullets ul li span.a-list-item::text` — join with `\n` |
+| `variant_asins` | script tag containing `dimensionToAsinMap` → JSON parse → values list |
+| `related_asins` | `#exportAlternativeAsinsInfo::attr(data-asinsinfo)` → JSON parse → keys |
+| `rating_breakdown` | `a[aria-label*="percent of reviews have"]` → parse all 5 stars |
+| `weight` | `th.prodDetSectionEntry` where th text == "Item Weight" → `xpath('../td')` |
+| `dimensions` | `th.prodDetSectionEntry` where "Item Dimensions" in th text → `xpath('../td')` |
+| `launch_date` | `th.prodDetSectionEntry` where th text == "Date First Available" → `xpath('../td')` |
+
+**JS-rendered** (Playwright + zip 19901 required):
+
+| Field | Selector |
+|---|---|
+| `price` | `span.apex-basisprice-value span.a-offscreen` (FBA) → fallback `#tp_price_block_total_price_ww span.a-offscreen` (FBM) |
+| `seller_name` | `#sellerProfileTriggerId::text` |
+| `seller_id` | `#sellerProfileTriggerId::attr(href)` → parse `seller=` param |
+| `is_fba` | `#sellerProfileTriggerId::attr(href)` → check `isAmazonFulfilled=1` |
+
+**Key selector fix (P23 prevention):** `.prodDetSectionEntry` is a class on `<th>` elements, not `<tr>` elements. Always select `th.prodDetSectionEntry` and navigate to sibling `<td>` with `xpath('../td')`.
+
+### Monitoring
+Null rates tracked per run for: `title`, `brand`, `rating`, `review_count`, `price`, `seller_name`, `is_fba`, `bsr_entries`, `last_month_sales`, `is_small_business`, `has_variants`.
+
+**Product table key fields (minimum — finalise before DDL):**
+
+| Field | Notes |
+|---|---|
+| `asin` | Primary key component |
+| `marketplace_id` | Multi-market support |
+| `browse_node_id` | Raw from product page — may differ from ranking node |
+| `node_status` | `'resolved'` \| `'unresolved'` |
+| `title` | Rarely changes — low refresh priority |
+| `description` | Rarely changes |
+| `bullet_points` | Rarely changes |
+| `seller_name` | Occasionally changes |
+| `rating` | Changes frequently |
+| `review_count` | Changes frequently |
+| `last_month_sales` | Changes frequently |
+| `scraped_at` | Timestamp of this fetch |
+
+**Deferred — product listing spider:** considered but deferred until after AmzProducts is complete and a stable ASIN watchlist exists. Intent: scrape listing pages (multiple ASINs per page) to track fast-changing fields (rating, review count, sales velocity) without hitting individual detail pages. Low bot risk vs detail pages. Revisit once AmzProducts is running and the watchlist is confirmed.
 
 ## Controller Pattern
 
@@ -60,9 +152,9 @@ When inspecting a new Amazon page for ACP attributes:
 
 ## Key Pitfalls
 
-**MUST READ before building any spider:** `docs/scraping_pitfalls.md` — 7 bugs from `AmzCategoryHierarchy` development.
+**MUST READ before building any spider:** `docs/scraping_pitfalls.md` — 8 bugs from `AmzCategoryHierarchy` development.
 
-The pitfalls below (P8–P21) are from `AmzRankings` development (P21 is an `AmzCategoryHierarchy` bug discovered during this work — also documented in `docs/scraping_pitfalls.md`). Apply to any future spider using Playwright or the controller pattern.
+The pitfalls below (P8–P22) are from `AmzRankings` and `AmzProducts` development. Apply to any future spider using Playwright or the controller pattern.
 
 **P8 — Amazon ACP lazy-loading**
 Never assume all items are in the static HTTP response. Amazon lazy-loads items 31–50 per page via ACP widget. Always dump raw HTML and count `div[data-asin]`. If count < expected, lazy loading is the cause. Fix: scrapy-playwright + scroll.
@@ -147,8 +239,16 @@ response.css('[class*="zg-bdg-text"]::text').getall()   # rank badges
 ```
 A selector that works on the saved HTML but returns nothing in the shell means Amazon serves different markup to Scrapy — add headers, check JS rendering requirements, or switch to Playwright.
 
+**Step 5 — Validate against RENDERED HTML for JS-dependent pages**
+For pages that require Playwright, scrapy shell (plain HTTP) will NOT render JS-dependent fields. Use the render scripts in `html_debug/` to save the post-Playwright DOM, then validate ALL selectors (static + JS) against the saved file before building.
+
 **Step 6 — Build the spider**
 Only after steps 1–5 are done. Selectors are confirmed; no guessing during development.
+
+**P22 — `networkidle` never fires on Amazon product pages**
+Amazon fires continuous analytics/tracking XHR requests after page load — Amplitude, CloudFront, Ads telemetry, etc. `wait_until='networkidle'` waits for the network to be idle for 500ms, which never happens on Amazon. Playwright's `page.goto()` and `wait_for_load_state('networkidle')` both time out.
+
+Fix: use `wait_for_load_state('load')` (page and blocking scripts loaded) followed by a fixed `wait_for_timeout(3000)` to let the buybox AJAX settle. Do not use `networkidle` for any Amazon page.
 
 ---
 
@@ -172,12 +272,17 @@ Playwright Chromium is installed at: `C:\Users\yashl\AppData\Local\ms-playwright
 
 - Scrapy 2.16 removed `CONCURRENT_REQUESTS_PER_IP` from `DownloaderAwarePriorityQueue`. Do not set it in `custom_settings`.
 - Current `AmzRankings` concurrency (plain HTTP): `CONCURRENT_REQUESTS=16`, `DOWNLOAD_DELAY=8`. With Playwright: `CONCURRENT_REQUESTS=4`, `DOWNLOAD_DELAY=8`, `PLAYWRIGHT_MAX_PAGES_PER_CONTEXT=4`. Resource blocking (images/fonts/stylesheets) keeps memory manageable. **Do not run all categories in one go** — Chromium V8 heap grows unbounded over hours and OOMs. Use `run_rankings.ps1` which runs one category at a time and restarts the browser between each.
+- Current `AmzProducts` concurrency: `CONCURRENT_REQUESTS=4`, `DOWNLOAD_DELAY=6`, `PLAYWRIGHT_MAX_PAGES_PER_CONTEXT=4`. Same resource blocking as AmzRankings.
 - `TWISTED_REACTOR` is already set to `asyncioreactor` in `settings.py` — required for `scrapy-playwright`.
 
 ## Docs
 
-- `docs/scraping_pitfalls.md` — 7 known bugs; must read before new spider
+- `docs/scraping_pitfalls.md` — 8 bugs (P1–P7, P21); must read before new spider
 - `docs/top_100_rankings_approach.md` — plan to reach 100 products/node via Playwright
 - `docs/sanity_checks.md` — SQL queries for verifying DB state
 - `docs/explainations.md` — closure table explanation for `amz_category_hierarchy`
 - `db/validate_hierarchy.sql` — 6 integrity checks; run after AmzCategoryHierarchy, before seed_controller.sql; all checks must return 0 rows
+- `db/seed_product_queue.sql` — manual seeder; run after AmzRankings merge cycle before AmzProducts
+- `html_debug/validate_product_selectors.py` — selector validation script for AmzProducts; reads rendered HTML files
+- `html_debug/render_product.py` — renders catchmaster product page with Playwright + zip 19901
+- `html_debug/render_bubbleblooms.py` — renders BubbleBlooms product page (SB badge validation)
