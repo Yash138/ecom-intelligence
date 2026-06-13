@@ -95,6 +95,12 @@ CREATE TABLE IF NOT EXISTS staging.amz_ranking_snapshot (
     PRIMARY KEY (id)
 );
 
+-- Unique constraint required for ON CONFLICT in bulk_upsert during spider writes.
+-- Dedup key within a single run: same ASIN cannot rank twice in the same node+run.
+ALTER TABLE staging.amz_ranking_snapshot
+    ADD CONSTRAINT amz_ranking_snapshot_run_asin_uq
+    UNIQUE (run_id, marketplace_id, list_type, subcategory_node_id, asin);
+
 CREATE INDEX IF NOT EXISTS idx_ranking_snapshot_lookup
     ON staging.amz_ranking_snapshot (marketplace_id, list_type, scraped_at);
 
