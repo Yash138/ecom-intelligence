@@ -348,15 +348,174 @@ WHERE marketplace_id = 'amazon_us' GROUP BY list_type, scrape_status ORDER BY li
 
 ---
 
+## Spider 3 — AmzProducts
+
+Reads leaf-node ASINs from `transformed.amz_product_scrape_queue`, scrapes the
+product detail page for each, and writes a snapshot to `staging.amz_product_snapshot`.
+
+- Requires Playwright — sets zip 19901 via the Amazon location popover before
+  loading any product pages (required for buybox fields: price, seller, is_fba).
+- Deletes each queue row on successful scrape.
+- Discovers variant ASINs (color/size siblings) and inserts them into the queue
+  automatically — they will be scraped in the same run if the queue is seeded
+  before the spider finishes, or in the next run.
+
+**Reads from:**
+- `transformed.amz_product_scrape_queue` — ASINs to scrape (seeded by `seed_product_queue.sql`)
+
+**Writes to:**
+- `staging.amz_product_snapshot` — one row per ASIN, UPSERT on re-scrape
+- `monitoring.scrape_run_field_stats` — null rates per field for this run
+
+### Pre-requisite — seed the product queue
+
+Run after both rankings merge cycles (bestseller + new_release) are done:
+
+```bash
+psql -d ecom_intel -U ecom_intel_admin -f db/seed_product_queue.sql
+```
+
+### Run (standard)
+
+```bash
+scrapy crawl AmzProducts -a marketplace_id=amazon_us \
+  -s LOG_FILE=logs/amz_products.log
+```
+
+### Run with HTML archiving (debugging / selector validation)
+
+Saves rendered HTML to `scraping/html_archive/<marketplace_id>_<asin>.html` (1.5–2.5 MB each).
+Off by default — only enable when diagnosing field extraction issues.
+
+```bash
+scrapy crawl AmzProducts -a marketplace_id=amazon_us -a save_html=true \
+  -s LOG_FILE=logs/amz_products.log
+```
+
+Custom archive directory:
+
+```bash
+scrapy crawl AmzProducts -a marketplace_id=amazon_us -a save_html=true \
+  -a html_archive_dir=D:/tmp/amz_html \
+  -s LOG_FILE=logs/amz_products.log
+```
+
+### Run a limited batch (testing / spot checks)
+
+```bash
+# Scrape only the first 5 ASINs from the queue
+scrapy crawl AmzProducts -a marketplace_id=amazon_us -a limit=5 \
+  -s LOG_FILE=logs/amz_products_test.log
+```
+
+### Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `marketplace_id` | `amazon_us` | Target marketplace. Must match queue rows. |
+| `use_playwright` | `true` | Must stay `true` for production — Playwright is required for the zip bootstrap and buybox fields. `false` skips the zip set and will return NULL price/seller/is_fba. |
+| `limit` | *(all)* | Stop after this many ASINs. Useful for smoke tests. |
+| `save_html` | `false` | Save rendered page HTML to disk for each scraped ASIN. |
+| `html_archive_dir` | `scraping/html_archive/` | Directory for saved HTML files. Created if absent. Ignored when `save_html=false`. |
+
+### Post-run validation
+
+```bash
+psql -d ecom_intel -U ecom_intel_admin -f db/validate_product_run.sql
+```
+
+All checks must return 0 rows. The summary at the bottom shows pass/fail counts.
+Key things it checks:
+
+| Tier | Check |
+|---|---|
+| 2 | Null rate per field vs. threshold (e.g. title < 5%, rating < 15%, last_month_sales < 65%) |
+| 3a | Price ≤ 0 or > $5,000 |
+| 3b | Rating outside 1.0–5.0 |
+| 3c | BSR rank > 5,000,000 (indicates regex parse failure) |
+| 3d | Variant ASIN not matching `^[A-Z0-9]{10}$` |
+| 3e | Title NULL or contains "robot"/"captcha" (bot-block detection) |
+| 3f | Variant entries missing dimension labels (variationValues parse failure) |
+| 4 | Queue not fully drained (remaining rows = failed scrapes) |
+
+### Verify
+
+```sql
+-- Snapshot count and field null rates for the latest run
+SELECT field_name, null_count, total_records,
+       round(null_rate * 100, 1) AS null_pct
+FROM monitoring.scrape_run_field_stats
+WHERE run_id = (
+    SELECT run_id FROM monitoring.scrape_run_field_stats
+    ORDER BY run_date DESC, run_id DESC LIMIT 1
+)
+ORDER BY null_rate DESC;
+
+-- Snapshot row count (total products scraped, all time)
+SELECT marketplace_id, COUNT(*) AS total_products,
+       MAX(last_captured_at) AS latest_scrape
+FROM staging.amz_product_snapshot
+GROUP BY marketplace_id;
+
+-- Queue remaining (should be 0 after a clean run)
+SELECT COUNT(*) AS remaining FROM transformed.amz_product_scrape_queue;
+
+-- Sample: check a specific product
+SELECT asin, title, brand, price, rating, review_count,
+       is_fba, seller_name, last_month_sales,
+       jsonb_array_length(bsr_entries) AS bsr_categories,
+       jsonb_array_length(variant_asins) AS variant_count
+FROM staging.amz_product_snapshot
+WHERE asin = 'B0BZYCJK89';
+```
+
+---
+
 ## Run order (Phase 0)
 
 ```
-1. AmzCategoryHierarchy          (once per market)
-2. validate_hierarchy.sql        (MUST pass all checks before proceeding)
-3. seed_controller.sql           (once, after hierarchy spider)
-4. AmzRankings list_type=bestseller
-5. AmzRankings list_type=new_release
-6. merge_rankings.sql            (after each rankings run)
+1. AmzCategoryHierarchy              (once per market)
+2. validate_hierarchy.sql            (MUST pass — all 6 checks must return 0 rows)
+3. seed_controller.sql               (once, after hierarchy spider)
+4. AmzRankings  list_type=bestseller
+5. merge_rankings.sql
+6. AmzRankings  list_type=new_release
+7. merge_rankings.sql
+8. seed_product_queue.sql            (after both rankings merge cycles)
+9. AmzProducts                       (reads queue, writes amz_product_snapshot)
+10. validate_product_run.sql         (MUST pass — all checks return 0 rows)
+```
+
+Full sequence as copy-paste commands (run from `scraping/`):
+
+```bash
+# 1. Category hierarchy
+scrapy crawl AmzCategoryHierarchy -a marketplace_id=amazon_us \
+  -s LOG_FILE=logs/amz_category_hierarchy.log
+
+# 2. Validate hierarchy (all 6 checks must return 0 rows)
+psql -d ecom_intel -U ecom_intel_admin -f db/validate_hierarchy.sql
+
+# 3. Seed the scrape controller
+psql -d ecom_intel -U ecom_intel_admin -f db/seed_controller.sql
+
+# 4+5. Bestseller rankings + merge
+.\run_rankings.ps1
+psql -d ecom_intel -U ecom_intel_admin -f db/merge_rankings.sql
+
+# 6+7. New release rankings + merge
+.\run_rankings.ps1 -ListType new_release
+psql -d ecom_intel -U ecom_intel_admin -f db/merge_rankings.sql
+
+# 8. Seed product queue
+psql -d ecom_intel -U ecom_intel_admin -f db/seed_product_queue.sql
+
+# 9. Scrape product pages
+scrapy crawl AmzProducts -a marketplace_id=amazon_us \
+  -s LOG_FILE=logs/amz_products.log
+
+# 10. Validate product run
+psql -d ecom_intel -U ecom_intel_admin -f db/validate_product_run.sql
 ```
 
 ### validate_hierarchy.sql — checks and what they catch
