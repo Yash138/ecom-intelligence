@@ -28,8 +28,11 @@ Usage:
     # Test run — 2 products only
     scrapy crawl AmzProducts -a limit=2 -s LOG_FILE=logs/test_products.log
 
-    # Save rendered HTML for debugging
+    # Save rendered HTML to default path (html_archive/ in repo root)
     scrapy crawl AmzProducts -a limit=5 -a save_html=true
+
+    # Save rendered HTML to a custom path
+    scrapy crawl AmzProducts -a save_html=true -a html_archive_dir=D:/html_dumps/owala
 
     # Plain HTTP (static fields only; price/seller/is_fba will be NULL)
     scrapy crawl AmzProducts -a use_playwright=false -a limit=10
@@ -85,7 +88,7 @@ class AmzProductsSpider(scrapy.Spider):
     }
 
     def __init__(self, marketplace_id='amazon_us', use_playwright='true',
-                 limit=None, save_html='false', **kwargs):
+                 limit=None, save_html='false', html_archive_dir=None, **kwargs):
         super().__init__(**kwargs)
         self.marketplace_id = marketplace_id
 
@@ -98,6 +101,7 @@ class AmzProductsSpider(scrapy.Spider):
 
         self.limit = int(limit) if limit else None
         self.save_html = str(save_html).lower() not in ('false', '0', 'no')
+        self._html_archive_dir_param = html_archive_dir  # None → default path resolved in spider_opened
 
         self.run_id = uuid.uuid4()
         self.run_date = dt.now().date()
@@ -150,8 +154,13 @@ class AmzProductsSpider(scrapy.Spider):
 
     def spider_opened(self, spider):
         self.db.connect()
-        _scraping_dir = os.path.dirname(os.path.abspath(__file__))
-        self._html_archive_dir = os.path.join(_scraping_dir, '..', 'html_archive')
+        if self._html_archive_dir_param:
+            self._html_archive_dir = os.path.abspath(self._html_archive_dir_param)
+        else:
+            _spiders_dir = os.path.dirname(os.path.abspath(__file__))
+            self._html_archive_dir = os.path.normpath(
+                os.path.join(_spiders_dir, '..', 'html_archive')
+            )
         if self.save_html:
             os.makedirs(self._html_archive_dir, exist_ok=True)
         self.log(
@@ -159,7 +168,8 @@ class AmzProductsSpider(scrapy.Spider):
             f"marketplace_id={self.marketplace_id} "
             f"use_playwright={self.use_playwright} "
             f"limit={self.limit} "
-            f"save_html={self.save_html}",
+            f"save_html={self.save_html} "
+            f"html_archive_dir={self._html_archive_dir}",
             20,
         )
 
