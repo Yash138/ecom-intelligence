@@ -1,5 +1,13 @@
 # Scraping — Context for Claude
 
+## Document Update History
+
+| Date | Sections Changed | Summary |
+|---|---|---|
+| 2026-06-09 | All | Initial creation — spider architecture, controller pattern, key pitfalls P8–P18, settings |
+| 2026-06-13 | Spider Architecture, Key Pitfalls, Docs | AmzProducts added; P19–P22 documented (contamination bugs, networkidle); new spider process updated |
+| 2026-06-13 | AmzProducts Design, Key Pitfalls | Corrected related_asins selector (FBT widget); added brand/seller/is_fba fallbacks for Amazon-sold products; P23 added (bootstrap wait_for_selector) |
+
 ## Spider Architecture
 
 Three spiders, run in order:
@@ -53,7 +61,7 @@ PageMethod('click', 'span#GLUXZipUpdate input.a-button-input'),
 | `title` | `#productTitle::text` — strip whitespace |
 | `rating` | `span.a-icon-alt::text` → regex `(\d+\.?\d*)` |
 | `review_count` | `#acrCustomerReviewText::text` → strip `()`, remove commas |
-| `brand` | `#bylineInfo::text` → regex `Visit the (.+?) Store` or strip `Brand: ` prefix |
+| `brand` | `#bylineInfo::text` → regex `Visit the (.+?) Store` or strip `Brand: ` prefix → fallback "Brand Name" row in `th.prodDetSectionEntry` table |
 | `main_image_url` | `#landingImage::attr(data-a-dynamic-image)` → JSON, key with largest area |
 | `bsr_entries` | `th.prodDetSectionEntry` → filter "Best Sellers Rank" → `xpath('../td')` → `li.xpath('string()')` → regex `#([\d,]+)\s+in\s+(.+?)(?:\s*\(See\b\|$)` |
 | `last_month_sales` | xpath `//*[contains(text(), "bought in past month")]` → regex `([\d,K+]+)\s+bought in past month` |
@@ -61,7 +69,7 @@ PageMethod('click', 'span#GLUXZipUpdate input.a-button-input'),
 | `is_small_business` | `[id*="sbe_badge"]` — presence check |
 | `about_this_item` | `#feature-bullets ul li span.a-list-item::text` — join with `\n` |
 | `variant_asins` | script tag containing `dimensionToAsinMap` → JSON parse → values list |
-| `related_asins` | `#exportAlternativeAsinsInfo::attr(data-asinsinfo)` → JSON parse → keys |
+| `related_asins` | `[data-cel-widget*="p13n-desktop-sims-fbt"] a[href*="/dp/"]` → regex `/dp/([A-Z0-9]{10})/` → deduplicate, exclude current ASIN |
 | `rating_breakdown` | `a[aria-label*="percent of reviews have"]` → parse all 5 stars |
 | `weight` | `th.prodDetSectionEntry` where th text == "Item Weight" → `xpath('../td')` |
 | `dimensions` | `th.prodDetSectionEntry` where "Item Dimensions" in th text → `xpath('../td')` |
@@ -72,11 +80,15 @@ PageMethod('click', 'span#GLUXZipUpdate input.a-button-input'),
 | Field | Selector |
 |---|---|
 | `price` | `span.apex-basisprice-value span.a-offscreen` (FBA) → fallback `#tp_price_block_total_price_ww span.a-offscreen` (FBM) |
-| `seller_name` | `#sellerProfileTriggerId::text` |
-| `seller_id` | `#sellerProfileTriggerId::attr(href)` → parse `seller=` param |
-| `is_fba` | `#sellerProfileTriggerId::attr(href)` → check `isAmazonFulfilled=1` |
+| `seller_name` | `#sellerProfileTriggerId::text` → fallback `#merchant-info` (Amazon-sold): first `<a>` text after "Sold by" |
+| `seller_id` | `#sellerProfileTriggerId::attr(href)` → parse `seller=` param (NULL for Amazon-sold — no `seller=` in their URL) |
+| `is_fba` | `#sellerProfileTriggerId::attr(href)` → check `isAmazonFulfilled=1` → fallback `#merchant-info` text: "Fulfilled by Amazon" |
 
-**Key selector fix (P23 prevention):** `.prodDetSectionEntry` is a class on `<th>` elements, not `<tr>` elements. Always select `th.prodDetSectionEntry` and navigate to sibling `<td>` with `xpath('../td')`.
+**Amazon-sold products** (e.g. Owala sold by "Amazon Resale") do not have `#bylineInfo` or `#sellerProfileTriggerId`. For these:
+- `brand`: falls back to "Brand Name" row in `th.prodDetSectionEntry` table
+- `seller_name` / `is_fba`: fall back to `#merchant-info` text parsing
+
+**Key selector fix:** `.prodDetSectionEntry` is a class on `<th>` elements, not `<tr>` elements. Always select `th.prodDetSectionEntry` and navigate to sibling `<td>` with `xpath('../td')`.
 
 ### Monitoring
 Null rates tracked per run for: `title`, `brand`, `rating`, `review_count`, `price`, `seller_name`, `is_fba`, `bsr_entries`, `last_month_sales`, `is_small_business`, `has_variants`.
@@ -249,6 +261,11 @@ Only after steps 1–5 are done. Selectors are confirmed; no guessing during dev
 Amazon fires continuous analytics/tracking XHR requests after page load — Amplitude, CloudFront, Ads telemetry, etc. `wait_until='networkidle'` waits for the network to be idle for 500ms, which never happens on Amazon. Playwright's `page.goto()` and `wait_for_load_state('networkidle')` both time out.
 
 Fix: use `wait_for_load_state('load')` (page and blocking scripts loaded) followed by a fixed `wait_for_timeout(3000)` to let the buybox AJAX settle. Do not use `networkidle` for any Amazon page.
+
+**P23 — Bootstrap zip-set: use `wait_for_selector` not a fixed timeout after clicking the popover**
+The zip code popover (`#GLUXZipUpdateInput`) takes a variable amount of time to open after clicking `#glow-ingress-block`. Using a fixed `wait_for_timeout(1500)` before `fill()` is fragile: if the page is slow, `fill()` hits its own 30s timeout and the error message says "Page.fill: Timeout 30000ms exceeded" — obscuring the real cause (popover never opened).
+
+Fix: replace `wait_for_timeout(1500)` with `wait_for_selector('#GLUXZipUpdateInput', state='visible', timeout=15000)`. This waits explicitly for the element and fails fast with a clear error if the popover doesn't open.
 
 ---
 

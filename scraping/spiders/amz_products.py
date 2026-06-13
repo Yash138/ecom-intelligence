@@ -201,7 +201,12 @@ class AmzProductsSpider(scrapy.Spider):
                         PageMethod('wait_for_load_state', 'load'),
                         PageMethod('wait_for_timeout', 1500),
                         PageMethod('click', '#glow-ingress-block'),
-                        PageMethod('wait_for_timeout', 1500),
+                        # wait_for_selector is more robust than a fixed timeout:
+                        # if the popover never opens (slow load, bot block), we get
+                        # a clear error immediately rather than a cryptic fill()
+                        # timeout 30s later (P23).
+                        PageMethod('wait_for_selector', '#GLUXZipUpdateInput',
+                                   state='visible', timeout=15000),
                         PageMethod('fill', '#GLUXZipUpdateInput', self.ZIP_CODE),
                         PageMethod('wait_for_timeout', 500),
                         PageMethod('click', 'span#GLUXZipUpdate input.a-button-input'),

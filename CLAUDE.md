@@ -16,6 +16,7 @@
 | 2026-06-09 | Current State, Repo Structure, Feedback Log | Playwright integration complete; AmzRankings now scrapes 100 products/node; `use_playwright` toggle added; venv noted |
 | 2026-06-13 | Current State, Maintenance Rules, Repo Structure, Feedback Log | Cross-category contamination (P19/P20/P21) found and fixed; all tables truncated; AmzCategoryHierarchy re-running; `validate_hierarchy.sql` added; bug count updated to 8; three additional code fixes applied (`_set_crawler`, docstring, empty root_categories log) |
 | 2026-06-13 | Current State, First Thing to Build, Repo Structure, Feedback Log | AmzProducts spider built; DDL §8a+8b added; `seed_product_queue.sql` created; `items.py` updated; selectors validated against rendered HTML; P22 documented |
+| 2026-06-13 | Maintenance Rules, Repo Structure, Feedback Log | Post-build selector fixes committed (related_asins FBT approach, brand/seller/is_fba fallbacks for Amazon-sold products); bootstrap zip-set hardened with wait_for_selector (P23); docs updated |
 
 ## Table of Contents
 
@@ -45,7 +46,7 @@
 - Keep it dense — pointers and decisions only. Link to docs; don't reproduce them.
 - Log all dev errors and user corrections in the Feedback Log section.
 - **Doc convention (all documents):** Every doc must have `## Document Update History` (table: Date | Sections Changed | Summary) immediately after the title block, then `## Table of Contents` (anchor links, 2 levels) immediately below. Update the history table on every edit.
-- **MUST READ before building any spider:** `docs/scraping_pitfalls.md` (P1–P7, P21 from AmzCategoryHierarchy) + `scraping/CLAUDE.md` Key Pitfalls (P8–P22 from AmzRankings/AmzProducts). These mistakes MUST be avoided at any cost.
+- **MUST READ before building any spider:** `docs/scraping_pitfalls.md` (P1–P7, P21 from AmzCategoryHierarchy) + `scraping/CLAUDE.md` Key Pitfalls (P8–P23 from AmzRankings/AmzProducts). These mistakes MUST be avoided at any cost.
 
 ## Current State
 - **Old infra (exists, India):** Scrapy-based scraping of amazon.in → PostgreSQL (`ecommerce` DB). ~7.5 GB, 2.3M ASINs, 1 year history. Airflow + DockerOperator on local machine. Not being migrated — separate concern.
@@ -150,7 +151,7 @@ Jungle Scout / SellerApp = Truth Class D (estimates, store with `is_estimate=tru
 - `docs/old_infra/table_structure.md` — old India DB schema
 - `docs/old_infra/data_dictionary.md` — old India data dictionary
 - `docs/old_infra/epip_first_step_strategy.md` — strategy rationale for building category scoring first
-- `docs/scraping_pitfalls.md` — **MUST READ** — P1–P7 + P21 from AmzCategoryHierarchy; P8–P22 in `scraping/CLAUDE.md`
+- `docs/scraping_pitfalls.md` — **MUST READ** — P1–P7 + P21 from AmzCategoryHierarchy; P8–P23 in `scraping/CLAUDE.md`
 - `scraping/` — Scrapy project; flat layout (no package wrapper)
 - `scraping/spiders/amz_products.py` — AmzProducts spider (built 2026-06-13)
 - `scraping/db/seed_product_queue.sql` — manual seeder for product queue; run after each rankings merge cycle
@@ -167,3 +168,4 @@ Jungle Scout / SellerApp = Truth Class D (estimates, store with `is_estimate=tru
 - 2026-06-13 | run_rankings.ps1 | Added `-Categories` param (pipe-delimited subset of categories). Fixed `-Category` silent failure caused by PowerShell case-insensitive variable collision (`$Categories` param overwrote `$categories` array). Renamed internal array to `$allCategories`.
 - 2026-06-13 | Code fixes | (1) `AmzCategoryHierarchy.from_crawler()` now calls `_set_crawler(crawler)` instead of `spider.settings = crawler.settings` — P9 consistency. (2) `_playwright_meta()` docstring corrected to describe `wait_for_load_state` flow. (3) `AmzRankings.start()` now logs a clear error when `root_categories` is empty ("Has seed_controller.sql been run?") instead of the misleading "all nodes already scraped" message.
 - 2026-06-13 | AmzProducts built | Spider built; 20 fields; Playwright + zip 19901 for buybox; delete-on-success queue; SCD2 timestamps; monitoring stats. Fixed selectors: `#bylineInfo` is `<a>` not container; `th.prodDetSectionEntry` is on `<th>` not `<tr>`; `networkidle` times out (P22). Validated on catchmaster + BubbleBlooms rendered HTML.
+- 2026-06-13 | AmzProducts post-build fixes | (1) `related_asins`: replaced `#exportAlternativeAsinsInfo` (doesn't exist) with FBT widget `[data-cel-widget*="p13n-desktop-sims-fbt"] a[href*="/dp/"]`. (2) `brand`/`seller_name`/`is_fba`: added `#merchant-info` fallbacks for Amazon-sold products (no `#bylineInfo` / `#sellerProfileTriggerId`). (3) Bootstrap zip-set: replaced `wait_for_timeout(1500)` with `wait_for_selector('#GLUXZipUpdateInput', state='visible', timeout=15000)` — P23. Validated on Owala (Amazon-sold FBA): brand=Owala, seller=Amazon Resale, is_fba=True, bsr rank 1 in 3 categories, dimensions=✓.
