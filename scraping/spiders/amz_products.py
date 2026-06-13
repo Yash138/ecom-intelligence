@@ -390,10 +390,10 @@ class AmzProductsSpider(scrapy.Spider):
     @staticmethod
     def _parse_brand(response) -> str | None:
         """
-        #bylineInfo is itself the <a> element (not a container).
-        Two patterns:
-          - "Visit the {Brand} Store"
-          - "Brand: {Brand}"
+        Two patterns for brand byline:
+          - #bylineInfo is itself the <a> element: "Visit the {Brand} Store" or "Brand: X"
+          - #bylineInfo absent (Amazon-sold or some listings): fall back to
+            "Brand Name" row in the product detail table.
         """
         text = (response.css('#bylineInfo::text').get() or '').strip()
         m = re.search(r'Visit the (.+?) Store', text)
@@ -403,6 +403,11 @@ class AmzProductsSpider(scrapy.Spider):
             return text[7:].strip()
         if text:
             return text
+        # Fallback: "Brand Name" row in product detail table
+        for th_el in response.css('th.prodDetSectionEntry'):
+            if (th_el.css('::text').get() or '').strip() == 'Brand Name':
+                td = (th_el.xpath('../td').css('::text').get() or '').strip()
+                return td or None
         return None
 
     @staticmethod
@@ -521,16 +526,24 @@ class AmzProductsSpider(scrapy.Spider):
 
     @staticmethod
     def _parse_related_asins(response) -> list | None:
-        """Parse exportAlternativeAsinsInfo data attribute. Returns list of ASINs or None."""
-        raw = response.css('#exportAlternativeAsinsInfo::attr(data-asinsinfo)').get()
-        if not raw:
+        """
+        Extract Frequently Bought Together (FBT) ASINs.
+        FBT items are in the widget [data-cel-widget*="p13n-desktop-sims-fbt"].
+        ASINs are embedded in product link hrefs (/dp/<ASIN>).
+        The current product's ASIN is excluded.
+        """
+        current_asin = response.meta.get('asin', '')
+        fbt_widget = response.css('[data-cel-widget*="p13n-desktop-sims-fbt"]')
+        if not fbt_widget:
             return None
-        try:
-            data = json.loads(raw)
-            asins = list(data.keys())
-            return asins if asins else None
-        except Exception:
-            return None
+        seen: set = set()
+        asins: list = []
+        for a in fbt_widget.css('a[href*="/dp/"]'):
+            m = re.search(r'/dp/([A-Z0-9]{10})', a.attrib.get('href', ''))
+            if m and m.group(1) not in seen and m.group(1) != current_asin:
+                seen.add(m.group(1))
+                asins.append(m.group(1))
+        return asins if asins else None
 
     @staticmethod
     def _parse_detail(response, label: str) -> str | None:
@@ -583,10 +596,31 @@ class AmzProductsSpider(scrapy.Spider):
 
     @staticmethod
     def _parse_seller_name(response) -> str | None:
-        return (response.css('#sellerProfileTriggerId::text').get() or '').strip() or None
+        """
+        Two seller display patterns:
+          - Third-party sellers: #sellerProfileTriggerId (link with seller profile)
+          - Amazon-sold products: #merchant-info "Sold by <name> and Fulfilled by Amazon"
+        """
+        name = (response.css('#sellerProfileTriggerId::text').get() or '').strip()
+        if name:
+            return name
+        # Fallback: #merchant-info — first <a> text after "Sold by"
+        merchant_texts = response.css('#merchant-info ::text').getall()
+        in_sold_by = False
+        for t in merchant_texts:
+            t = t.strip()
+            if not t:
+                continue
+            if 'Sold by' in t:
+                in_sold_by = True
+                continue
+            if in_sold_by and t not in ('and', '.', ','):
+                return t
+        return None
 
     @staticmethod
     def _parse_seller_id(response) -> str | None:
+        """seller= query param from the seller profile link. NULL for Amazon-sold products."""
         href = response.css('#sellerProfileTriggerId::attr(href)').get() or ''
         m = re.search(r'seller=([A-Z0-9]+)', href)
         return m.group(1) if m else None
@@ -594,13 +628,21 @@ class AmzProductsSpider(scrapy.Spider):
     @staticmethod
     def _parse_is_fba(response) -> bool | None:
         """
-        Returns True if Amazon fulfills, False if seller fulfills, None if seller
-        info is missing (no buybox rendered — may mean out of stock or blocked page).
+        Returns True if Amazon fulfills, False if seller fulfills, None if no
+        buybox info rendered (may mean out of stock or blocked page).
+
+        Two detection patterns:
+          - #sellerProfileTriggerId href contains isAmazonFulfilled=1 (third-party FBA)
+          - #merchant-info text contains "Fulfilled by Amazon" (Amazon-sold/FBA)
         """
         href = response.css('#sellerProfileTriggerId::attr(href)').get()
-        if href is None:
-            return None
-        return bool(re.search(r'isAmazonFulfilled=1', href))
+        if href is not None:
+            return bool(re.search(r'isAmazonFulfilled=1', href))
+        # Fallback: merchant-info for Amazon-sold products
+        merchant_text = ' '.join(response.css('#merchant-info ::text').getall())
+        if merchant_text.strip():
+            return 'Fulfilled by Amazon' in merchant_text
+        return None
 
     # ------------------------------------------------------------------
     # DB writes
