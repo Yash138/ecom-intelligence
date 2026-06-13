@@ -7,6 +7,7 @@
 | 2026-06-09 | All | Initial creation — spider architecture, controller pattern, key pitfalls P8–P18, settings |
 | 2026-06-13 | Spider Architecture, Key Pitfalls, Docs | AmzProducts added; P19–P22 documented (contamination bugs, networkidle); new spider process updated |
 | 2026-06-13 | AmzProducts Design, Key Pitfalls | Corrected related_asins selector (FBT widget); added brand/seller/is_fba fallbacks for Amazon-sold products; P23 added (bootstrap wait_for_selector) |
+| 2026-06-13 | AmzProducts Design, Key Pitfalls | Fixed last_month_sales (split-text badge, P24); fixed variant_asins to include color/size labels via variationValues parsing |
 
 ## Spider Architecture
 
@@ -64,11 +65,11 @@ PageMethod('click', 'span#GLUXZipUpdate input.a-button-input'),
 | `brand` | `#bylineInfo::text` → regex `Visit the (.+?) Store` or strip `Brand: ` prefix → fallback "Brand Name" row in `th.prodDetSectionEntry` table |
 | `main_image_url` | `#landingImage::attr(data-a-dynamic-image)` → JSON, key with largest area |
 | `bsr_entries` | `th.prodDetSectionEntry` → filter "Best Sellers Rank" → `xpath('../td')` → `li.xpath('string()')` → regex `#([\d,]+)\s+in\s+(.+?)(?:\s*\(See\b\|$)` |
-| `last_month_sales` | xpath `//*[contains(text(), "bought in past month")]` → regex `([\d,K+]+)\s+bought in past month` |
+| `last_month_sales` | `contains(., 'bought in past month/week')` innermost + `string()` → regex `([\d,K+]+)\s+bought in past (?:month\|week)`; badge text is split across child elements so `contains(text(), ...)` never matches |
 | `has_variants` | `[id*="inline-twister"]` — presence check |
 | `is_small_business` | `[id*="sbe_badge"]` — presence check |
 | `about_this_item` | `#feature-bullets ul li span.a-list-item::text` — join with `\n` |
-| `variant_asins` | script tag containing `dimensionToAsinMap` → JSON parse → values list |
+| `variant_asins` | script tag containing `dimensionToAsinMap` + `variationValues` + `dimensions`; keys use `_` delimiter (e.g. `"12_5"` → color[12]+size[5]); returns `[{"asin":..., "color_name":..., "size_name":...}]` |
 | `related_asins` | `[data-cel-widget*="p13n-desktop-sims-fbt"] a[href*="/dp/"]` → regex `/dp/([A-Z0-9]{10})/` → deduplicate, exclude current ASIN |
 | `rating_breakdown` | `a[aria-label*="percent of reviews have"]` → parse all 5 stars |
 | `weight` | `th.prodDetSectionEntry` where th text == "Item Weight" → `xpath('../td')` |
@@ -266,6 +267,15 @@ Fix: use `wait_for_load_state('load')` (page and blocking scripts loaded) follow
 The zip code popover (`#GLUXZipUpdateInput`) takes a variable amount of time to open after clicking `#glow-ingress-block`. Using a fixed `wait_for_timeout(1500)` before `fill()` is fragile: if the page is slow, `fill()` hits its own 30s timeout and the error message says "Page.fill: Timeout 30000ms exceeded" — obscuring the real cause (popover never opened).
 
 Fix: replace `wait_for_timeout(1500)` with `wait_for_selector('#GLUXZipUpdateInput', state='visible', timeout=15000)`. This waits explicitly for the element and fails fast with a clear error if the popover doesn't open.
+
+**P24 — `contains(text(), ...)` fails when badge text is split across child elements**
+Amazon's "X bought in past month" badge splits the count and label: `<span><span>20K+</span> bought in past month</span>`. `contains(text(), "bought in past month")` checks direct text nodes only — it finds 0 matches because "20K+" is in a child `<span>` and the parent's direct text node is just " bought in past month" (no count).
+
+`el.xpath('text()').get()` also only returns the FIRST direct text node (often whitespace), not the full badge text.
+
+Fix: use `contains(., ...)` (checks all descendant text) with the innermost-element constraint `not(descendant::*[contains(., ...)])` to avoid matching the entire page body. Then use `el.xpath('string()').get()` to concatenate all descendant text.
+
+Same pattern applies to any badge/label where number and text are in sibling or nested elements. Also: Amazon shows "past week" instead of "past month" for high-velocity products — handle both periods.
 
 ---
 

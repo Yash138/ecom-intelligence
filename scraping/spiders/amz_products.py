@@ -489,14 +489,27 @@ class AmzProductsSpider(scrapy.Spider):
     @staticmethod
     def _parse_last_month_sales(response) -> str | None:
         """
-        Extracts "100+" or "1K+" from the "X bought in past month" banner.
-        Amazon uses varying element types; xpath text search is most resilient.
+        Extracts "100+", "1K+", "20K+" from the "X bought in past month/week" badge.
+
+        Amazon splits the count and label across child elements, so
+        contains(text(), ...) never matches — the count lives in a child <span>
+        and " bought in past month" is a sibling text node of the parent element.
+        Must use contains(., ...) (matches all descendant text) with string() to
+        reconstruct the full text.
+
+        Amazon shows "past week" on some high-velocity products instead of
+        "past month". Both are captured; the raw count is returned either way.
         """
-        for el in response.xpath('//*[contains(text(), "bought in past month")]'):
-            text = (el.xpath('text()').get() or '').strip()
-            m = re.search(r'([\d,K+]+)\s+bought in past month', text)
-            if m:
-                return m.group(1)
+        for period in ('past month', 'past week'):
+            phrase = f'bought in {period}'
+            for el in response.xpath(
+                f"//*[contains(., '{phrase}') and "
+                f"not(descendant::*[contains(., '{phrase}')])]"
+            ):
+                full_text = (el.xpath('string()').get() or '').strip()
+                m = re.search(r'([\d,K+]+)\s+bought in past (?:month|week)', full_text)
+                if m:
+                    return m.group(1)
         return None
 
     @staticmethod
@@ -510,23 +523,86 @@ class AmzProductsSpider(scrapy.Spider):
     @staticmethod
     def _parse_variant_asins(response) -> list | None:
         """
-        Parse dimensionToAsinMap from inline <script> tags.
-        Returns a sorted list of unique ASINs (excluding current product if present).
-        Stores as simple ASIN list — type/value details require a deeper parse
-        of variationValues which has a different key structure.
+        Parse variant ASINs with their dimension labels from inline <script> tags.
+
+        Amazon encodes variant data in three co-located keys:
+          - dimensionToAsinMap: {"12_5": "B0XX", ...}
+            Keys are underscore-delimited dimension indices (one per dimension).
+          - dimensions: ["color_name", "size_name"]
+            Maps each index position to a dimension name.
+          - variationValues: {"color_name": ["Blue", "Red"], "size_name": ["S", "M"]}
+            Maps each dimension to its ordered list of values.
+
+        Key "12_5" with dimensions ["color_name", "size_name"] decodes as:
+          color_name[12] + size_name[5] → the ASIN's color and size.
+
+        Returns a list of dicts, one per unique ASIN:
+          [{"asin": "B0XX", "color_name": "Blue", "size_name": "Large"}, ...]
+
+        variationValues uses nested arrays so a brace-counting approach is needed
+        to find the object boundaries (simple regex with [^}]+ would stop too early).
         """
         for script in response.css('script::text').getall():
             if 'dimensionToAsinMap' not in script:
                 continue
-            m = re.search(r'"dimensionToAsinMap"\s*:\s*(\{[^}]*\})', script)
-            if m:
+
+            m_asin = re.search(r'"dimensionToAsinMap"\s*:\s*(\{[^}]+\})', script)
+            if not m_asin:
+                break
+            try:
+                asin_map = json.loads(m_asin.group(1))
+            except Exception:
+                break
+
+            # dimensions: simple flat array
+            dimensions: list = []
+            m_dims = re.search(r'"dimensions"\s*:\s*(\[[^\]]+\])', script)
+            if m_dims:
                 try:
-                    asin_map = json.loads(m.group(1))
-                    asins = sorted(set(asin_map.values()))
-                    return asins if asins else None
+                    dimensions = json.loads(m_dims.group(1))
                 except Exception:
                     pass
-            break
+
+            # variationValues: nested object — count braces to find end
+            variation_values: dict = {}
+            idx_vv = script.find('"variationValues"')
+            if idx_vv >= 0:
+                try:
+                    brace_start = script.index('{', idx_vv)
+                    depth = 0
+                    end = brace_start
+                    for pos, ch in enumerate(script[brace_start:], brace_start):
+                        if ch == '{':
+                            depth += 1
+                        elif ch == '}':
+                            depth -= 1
+                            if depth == 0:
+                                end = pos
+                                break
+                    variation_values = json.loads(script[brace_start:end + 1])
+                except Exception:
+                    pass
+
+            seen: set = set()
+            variants: list = []
+            for key, asin in asin_map.items():
+                if asin in seen:
+                    continue
+                seen.add(asin)
+                variant: dict = {'asin': asin}
+                if dimensions and variation_values:
+                    for i, idx_str in enumerate(key.split('_')):
+                        if i >= len(dimensions):
+                            break
+                        dim_name = dimensions[i]
+                        vals = variation_values.get(dim_name, [])
+                        try:
+                            variant[dim_name] = vals[int(idx_str)]
+                        except (IndexError, ValueError):
+                            pass
+                variants.append(variant)
+
+            return variants if variants else None
         return None
 
     @staticmethod
@@ -717,7 +793,9 @@ class AmzProductsSpider(scrapy.Spider):
 
     def _queue_variant_asins(self, variant_asins: list, source_asin: str):
         """Insert newly discovered variant ASINs into the scrape queue."""
-        for variant_asin in variant_asins:
+        for variant in variant_asins:
+            # variant_asins is now a list of dicts {"asin": ..., "color_name": ..., ...}
+            variant_asin = variant['asin'] if isinstance(variant, dict) else variant
             if variant_asin == source_asin:
                 continue
             product_url = f'https://www.amazon.com/dp/{variant_asin}'
