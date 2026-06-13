@@ -18,6 +18,7 @@
 | 2026-06-13 | Current State, First Thing to Build, Repo Structure, Feedback Log | AmzProducts spider built; DDL §8a+8b added; `seed_product_queue.sql` created; `items.py` updated; selectors validated against rendered HTML; P22 documented |
 | 2026-06-13 | Maintenance Rules, Repo Structure, Feedback Log | Post-build selector fixes committed (related_asins FBT approach, brand/seller/is_fba fallbacks for Amazon-sold products); bootstrap zip-set hardened with wait_for_selector (P23); docs updated |
 | 2026-06-13 | Feedback Log | Fixed last_month_sales (P24 — split-text badge requires contains(.,...)+string()); fixed variant_asins to include color/size labels (dimensionToAsinMap + variationValues); validated on Owala |
+| 2026-06-14 | Repo Structure, Feedback Log | `validate_product_run.sql` added; `html_archive_dir` param added to AmzProducts; Tier 3f window-function-in-HAVING fixed |
 
 ## Table of Contents
 
@@ -47,7 +48,7 @@
 - Keep it dense — pointers and decisions only. Link to docs; don't reproduce them.
 - Log all dev errors and user corrections in the Feedback Log section.
 - **Doc convention (all documents):** Every doc must have `## Document Update History` (table: Date | Sections Changed | Summary) immediately after the title block, then `## Table of Contents` (anchor links, 2 levels) immediately below. Update the history table on every edit.
-- **MUST READ before building any spider:** `docs/scraping_pitfalls.md` (P1–P7, P21 from AmzCategoryHierarchy) + `scraping/CLAUDE.md` Key Pitfalls (P8–P24 from AmzRankings/AmzProducts). These mistakes MUST be avoided at any cost.
+- **MUST READ before building any spider:** `docs/scraping_pitfalls.md` (P1–P7, P21 from AmzCategoryHierarchy) + `scraping/CLAUDE.md` Key Pitfalls (P8–P25 from AmzRankings/AmzProducts). These mistakes MUST be avoided at any cost.
 
 ## Current State
 - **Old infra (exists, India):** Scrapy-based scraping of amazon.in → PostgreSQL (`ecommerce` DB). ~7.5 GB, 2.3M ASINs, 1 year history. Airflow + DockerOperator on local machine. Not being migrated — separate concern.
@@ -157,13 +158,14 @@ Jungle Scout / SellerApp = Truth Class D (estimates, store with `is_estimate=tru
 - `scraping/spiders/amz_products.py` — AmzProducts spider (built 2026-06-13)
 - `scraping/db/seed_product_queue.sql` — manual seeder for product queue; run after each rankings merge cycle
 - `scraping/db/ddl.sql` — full schema including §8a (queue) + §8b (product snapshot)
+- `scraping/db/validate_product_run.sql` — post-run health check; run after each AmzProducts batch; 0 rows on all checks = healthy
 
 ## Feedback / Error Log
 <!-- Format: YYYY-MM-DD | context | what went wrong or was corrected -->
 - 2026-05-11 | CLAUDE.md setup | Do not mix Sprouts work email with this personal project
 - 2026-06-07 | AmzCategoryHierarchy | 7 bugs fixed — full details in `docs/scraping_pitfalls.md`
 - 2026-06-09 | venv | Always use `.venv_scrape` in repo root — never system Python or global pip
-- 2026-06-09 | AmzRankings | Playwright integration done; 100 products/node confirmed; `use_playwright` toggle added; docs: `scraping/docs/top_100_rankings_approach.md`, `scraping/docs/possible_enhancements.md`
+- 2026-06-09 | AmzRankings | Playwright integration done; `use_playwright` toggle added; docs: `scraping/docs/top_100_rankings_approach.md`, `scraping/docs/possible_enhancements.md`
 - 2026-06-13 | AmzRankings contamination | Three cross-category contamination bugs found and fixed: P19 (`_mark_node_complete` matched by subcategory name not node_id), P20 (closure table contamination allowed wrong categories into eligibility query), P21 (shared URL slug `/hi/` caused three root categories to overwrite same `amz_category` row). All `ecom_intel` tables truncated. Full bug details: `scraping/CLAUDE.md` P19–P21; P21 also in `docs/scraping_pitfalls.md`.
 - 2026-06-13 | validate_hierarchy.sql | New pre-seed validation script added (`scraping/db/validate_hierarchy.sql`). 6 checks. Must run after `AmzCategoryHierarchy`, before `seed_controller.sql`. All checks must return 0 rows before proceeding.
 - 2026-06-13 | run_rankings.ps1 | Added `-Categories` param (pipe-delimited subset of categories). Fixed `-Category` silent failure caused by PowerShell case-insensitive variable collision (`$Categories` param overwrote `$categories` array). Renamed internal array to `$allCategories`.
@@ -171,3 +173,5 @@ Jungle Scout / SellerApp = Truth Class D (estimates, store with `is_estimate=tru
 - 2026-06-13 | AmzProducts built | Spider built; 20 fields; Playwright + zip 19901 for buybox; delete-on-success queue; SCD2 timestamps; monitoring stats. Fixed selectors: `#bylineInfo` is `<a>` not container; `th.prodDetSectionEntry` is on `<th>` not `<tr>`; `networkidle` times out (P22). Validated on catchmaster + BubbleBlooms rendered HTML.
 - 2026-06-13 | AmzProducts post-build fixes | (1) `related_asins`: replaced `#exportAlternativeAsinsInfo` (doesn't exist) with FBT widget `[data-cel-widget*="p13n-desktop-sims-fbt"] a[href*="/dp/"]`. (2) `brand`/`seller_name`/`is_fba`: added `#merchant-info` fallbacks for Amazon-sold products (no `#bylineInfo` / `#sellerProfileTriggerId`). (3) Bootstrap zip-set: replaced `wait_for_timeout(1500)` with `wait_for_selector('#GLUXZipUpdateInput', state='visible', timeout=15000)` — P23. Validated on Owala (Amazon-sold FBA): brand=Owala, seller=Amazon Resale, is_fba=True, bsr rank 1 in 3 categories, dimensions=✓.
 - 2026-06-13 | AmzProducts selector fixes #2 | (1) `last_month_sales`: changed `contains(text(), ...)` → `contains(., ...)` + `string()` for split-text badge; also handles "past week" badge (P24). (2) `variant_asins`: now decodes full dimension labels from `variationValues` + `dimensions`; returns `[{"asin":..., "color_name":..., "size_name":...}]` instead of plain ASIN list. `_queue_variant_asins` updated for new dict format. Validated on Owala: last_month_sales=20K+, variant_asins=65 entries with color+size.
+- 2026-06-13 | AmzRankings Playwright scroll fix | P25: `window.scrollTo(bottom)` does not trigger Amazon's IntersectionObserver; lazy-load requires `scrollIntoView` on the last visible card, repeated until count reaches 50. Fixed in `_playwright_meta()` — replaced single scrollTo+1.5s with async IIFE (up to 5 iterations × 2s). Verified via `html_debug/test_scroll.py`: 30→38→46→50 in 3 passes. See P25 in `scraping/CLAUDE.md`.
+- 2026-06-14 | validate_product_run.sql | Tier 3f initial draft used window function in HAVING (illegal in Postgres) — rewrote as CTE with GROUP BY. Script verified against live DB: all checks 0 rows, Tier 4 shows 69 Owala variant ASINs in queue (expected from test run, not a bug).

@@ -8,6 +8,7 @@
 | 2026-06-13 | Spider Architecture, Key Pitfalls, Docs | AmzProducts added; P19–P22 documented (contamination bugs, networkidle); new spider process updated |
 | 2026-06-13 | AmzProducts Design, Key Pitfalls | Corrected related_asins selector (FBT widget); added brand/seller/is_fba fallbacks for Amazon-sold products; P23 added (bootstrap wait_for_selector) |
 | 2026-06-13 | AmzProducts Design, Key Pitfalls | Fixed last_month_sales (split-text badge, P24); fixed variant_asins to include color/size labels via variationValues parsing |
+| 2026-06-13 | Key Pitfalls, Spider Architecture | P25: window.scrollTo does not trigger Amazon IntersectionObserver lazy-load; fixed with iterative scrollIntoView IIFE in _playwright_meta() |
 
 ## Spider Architecture
 
@@ -167,10 +168,10 @@ When inspecting a new Amazon page for ACP attributes:
 
 **MUST READ before building any spider:** `docs/scraping_pitfalls.md` — 8 bugs from `AmzCategoryHierarchy` development.
 
-The pitfalls below (P8–P22) are from `AmzRankings` and `AmzProducts` development. Apply to any future spider using Playwright or the controller pattern.
+The pitfalls below (P8–P25) are from `AmzRankings` and `AmzProducts` development. Apply to any future spider using Playwright or the controller pattern.
 
 **P8 — Amazon ACP lazy-loading**
-Never assume all items are in the static HTTP response. Amazon lazy-loads items 31–50 per page via ACP widget. Always dump raw HTML and count `div[data-asin]`. If count < expected, lazy loading is the cause. Fix: scrapy-playwright + scroll.
+Never assume all items are in the static HTTP response. Amazon lazy-loads items 31–50 per page via ACP widget. Always dump raw HTML and count `div[data-asin]`. If count < expected, lazy loading is the cause. Fix: scrapy-playwright + iterative scrollIntoView (see P25 for the correct scroll approach).
 
 **P9 — `from_crawler` override must call `_set_crawler()`**
 Scrapy 2.16 sets `spider.crawler` (no underscore) via `spider._set_crawler(crawler)`. If you override `from_crawler` without calling `super()`, you must call `spider._set_crawler(crawler)` explicitly. Setting `spider._crawler = crawler` manually is wrong — `spider.crawler` won't exist and the dupe filter will crash with `AttributeError: 'XSpider' object has no attribute 'crawler'` the first time a duplicate URL is encountered. This bug is silent on small runs (no dupes) and only surfaces at scale.
@@ -276,6 +277,26 @@ Amazon's "X bought in past month" badge splits the count and label: `<span><span
 Fix: use `contains(., ...)` (checks all descendant text) with the innermost-element constraint `not(descendant::*[contains(., ...)])` to avoid matching the entire page body. Then use `el.xpath('string()').get()` to concatenate all descendant text.
 
 Same pattern applies to any badge/label where number and text are in sibling or nested elements. Also: Amazon shows "past week" instead of "past month" for high-velocity products — handle both periods.
+
+**P25 — `window.scrollTo(bottom)` does not trigger Amazon's IntersectionObserver lazy-load**
+Amazon uses IntersectionObserver (not a scroll event) to lazy-load items 31–50 per page. `window.scrollTo(0, document.body.scrollHeight)` fires a scroll event but does NOT trigger the observer — the count stays at 30. Confirmed via live Playwright test.
+
+Fix: repeatedly scroll the last visible card into the viewport using `scrollIntoView`, then wait 2s for the XHR batch to arrive. Repeat until count reaches 50 or stops growing. Typical path: 30 → 38 → 46 → 50 (3 iterations, ~6s total). Implemented as an async IIFE in `_playwright_meta()`:
+```javascript
+(async () => {
+    const sel = 'div[data-asin]';
+    for (let i = 0; i < 5; i++) {
+        const cards = document.querySelectorAll(sel);
+        if (cards.length >= 50) break;
+        const prev = cards.length;
+        if (cards.length > 0)
+            cards[cards.length - 1].scrollIntoView({behavior: 'instant', block: 'end'});
+        await new Promise(r => setTimeout(r, 2000));
+        if (document.querySelectorAll(sel).length === prev) break;
+    }
+})()
+```
+Rule: for any lazy-load on Amazon, test with a Playwright debug script first (`html_debug/test_scroll.py`) — do not assume the scroll mechanism without verification.
 
 ---
 
