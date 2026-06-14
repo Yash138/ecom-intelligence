@@ -48,7 +48,7 @@
 - Keep it dense — pointers and decisions only. Link to docs; don't reproduce them.
 - Log all dev errors and user corrections in the Feedback Log section.
 - **Doc convention (all documents):** Every doc must have `## Document Update History` (table: Date | Sections Changed | Summary) immediately after the title block, then `## Table of Contents` (anchor links, 2 levels) immediately below. Update the history table on every edit.
-- **MUST READ before building any spider:** `docs/scraping_pitfalls.md` (P1–P7, P21 from AmzCategoryHierarchy) + `scraping/CLAUDE.md` Key Pitfalls (P8–P25 from AmzRankings/AmzProducts). These mistakes MUST be avoided at any cost.
+- **MUST READ before building any spider:** `docs/scraping_pitfalls.md` (P1–P7, P21 from AmzCategoryHierarchy) + `scraping/CLAUDE.md` Key Pitfalls (P8–P26 from AmzRankings/AmzProducts). These mistakes MUST be avoided at any cost.
 
 ## Current State
 - **Old infra (exists, India):** Scrapy-based scraping of amazon.in → PostgreSQL (`ecommerce` DB). ~7.5 GB, 2.3M ASINs, 1 year history. Airflow + DockerOperator on local machine. Not being migrated — separate concern.

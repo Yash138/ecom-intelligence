@@ -9,6 +9,7 @@
 | 2026-06-13 | AmzProducts Design, Key Pitfalls | Corrected related_asins selector (FBT widget); added brand/seller/is_fba fallbacks for Amazon-sold products; P23 added (bootstrap wait_for_selector) |
 | 2026-06-13 | AmzProducts Design, Key Pitfalls | Fixed last_month_sales (split-text badge, P24); fixed variant_asins to include color/size labels via variationValues parsing |
 | 2026-06-13 | Key Pitfalls, Spider Architecture | P25: window.scrollTo does not trigger Amazon IntersectionObserver lazy-load; fixed with iterative scrollIntoView IIFE in _playwright_meta() |
+| 2026-06-14 | Key Pitfalls, AmzProducts Design | P26: Amazon A/B / bot-detection serves reduced page layouts; sparse-page retry added to AmzProducts parse_product() |
 
 ## Spider Architecture
 
@@ -297,6 +298,15 @@ Fix: repeatedly scroll the last visible card into the viewport using `scrollInto
 })()
 ```
 Rule: for any lazy-load on Amazon, test with a Playwright debug script first (`html_debug/test_scroll.py`) — do not assume the scroll mechanism without verification.
+
+**P26 — Amazon A/B testing / bot-detection cohort serves reduced page layouts**
+Amazon assigns each browser session to a test cohort via session cookies. Some cohorts receive a reduced layout where BSR, rating breakdown, variant selectors, product details table, and small business badge are entirely absent — even with the correct zip set and no login required. This is independent of the delivery zip and is not fixable by cookie manipulation.
+
+Observed: two Chrome instances, same product, same zip (19901), no login — one shows full data, one shows all mid-page sections hidden.
+
+Fix in `AmzProducts`: after extracting fields, if `bsr_entries=None AND rating_breakdown=None` (strongest signal — both are always rendered on a full-layout page), re-issue the request once with `sparse_retry=1` in meta and `dont_filter=True`. The fresh request gets a new session cookie and may hit a different cohort. DB write and queue delete are deferred until after the retry resolves. One retry max — if still sparse, write what we have and let the null rate monitor flag it.
+
+Signal rationale: `bsr_entries` and `rating_breakdown` are always present on a normal product page regardless of login, zip, price availability, or product type. Both being NULL simultaneously means the entire mid-page section block failed to render, which is a layout issue not a data issue. Using both together avoids false positives from products that legitimately have no BSR (e.g. new products) or no reviews.
 
 ---
 
