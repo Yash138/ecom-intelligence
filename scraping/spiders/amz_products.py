@@ -301,10 +301,58 @@ class AmzProductsSpider(scrapy.Spider):
         deletes from queue on success, queues discovered variant ASINs.
         """
         asin = response.meta['asin']
+        sparse_retry = response.meta.get('sparse_retry', 0)
 
         self.log(f"Parsing product asin={asin} url={response.url}", 20)
 
         data = self._extract_product(response, asin)
+
+        # Sparse-page detection: Amazon's A/B testing / bot-detection cohort
+        # assignment can serve a reduced page layout where BSR, rating breakdown,
+        # variants, and product details are entirely absent. The strongest signal
+        # is bsr_entries=None AND rating_breakdown=None — both are mid-page
+        # sections that Amazon renders regardless of login or price availability.
+        # Retry once with a fresh request; the new session may hit a different
+        # cohort and serve the full layout. Do NOT write to DB or delete from
+        # queue until after the retry resolves.
+        if (
+            data.get('bsr_entries') is None
+            and data.get('rating_breakdown') is None
+            and sparse_retry == 0
+        ):
+            self.log(
+                f"  asin={asin} sparse page (bsr_entries=None, rating_breakdown=None) "
+                f"— retrying once with fresh request.",
+                30,
+            )
+            retry_meta: dict = {
+                'asin':         asin,
+                'product_url':  response.meta['product_url'],
+                'sparse_retry': 1,
+            }
+            if self.use_playwright:
+                retry_meta['playwright'] = True
+                retry_meta['playwright_page_methods'] = [
+                    PageMethod('wait_for_load_state', 'load'),
+                    PageMethod('wait_for_timeout', 3000),
+                ]
+            yield scrapy.Request(
+                url=response.meta['product_url'],
+                callback=self.parse_product,
+                meta=retry_meta,
+                errback=self.handle_error,
+                dont_filter=True,
+            )
+            return
+
+        if sparse_retry > 0:
+            if data.get('bsr_entries') is None and data.get('rating_breakdown') is None:
+                self.log(
+                    f"  asin={asin} still sparse after retry — writing what we have.",
+                    30,
+                )
+            else:
+                self.log(f"  asin={asin} retry recovered full layout.", 20)
 
         # Optionally save rendered HTML for debugging/replay
         html_file_path = None
