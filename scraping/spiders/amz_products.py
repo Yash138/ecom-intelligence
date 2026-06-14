@@ -430,7 +430,7 @@ class AmzProductsSpider(scrapy.Spider):
             'rating':           self._parse_rating(response),
             'review_count':     self._parse_review_count(response),
             'rating_breakdown': self._parse_rating_breakdown(response),
-            'bsr_entries':      self._parse_bsr(response),
+            'bsr_entries':      self._parse_bsr(response) or self._parse_breadcrumb_categories(response),
             'last_month_sales': self._parse_last_month_sales(response),
             'price':            self._parse_price(response),
             'seller_name':      self._parse_seller_name(response),
@@ -543,6 +543,36 @@ class AmzProductsSpider(scrapy.Spider):
                     entries.append({'rank': rank, 'category': cat})
             break
         return entries if entries else None
+
+    @staticmethod
+    def _parse_breadcrumb_categories(response) -> list | None:
+        """
+        Fallback category source when BSR section is absent (sparse page / A/B layout).
+
+        Extracts the breadcrumb navigation path: the <li> elements inside
+        #wayfinding-breadcrumbs_feature_div, skipping divider items
+        (li.a-breadcrumb-divider). All breadcrumb items — including the leaf node —
+        have <a> tags confirmed via browser inspect.
+
+        Returns entries in the same shape as _parse_bsr() but with rank=None and
+        from_breadcrumb=True so consumers can distinguish them:
+            [
+                {"rank": None, "category": "Patio, Lawn & Garden", "from_breadcrumb": True},
+                {"rank": None, "category": "Grill Thermometers",   "from_breadcrumb": True},
+            ]
+        Returns None if the breadcrumb element is not found.
+        """
+        crumbs = [
+            t.strip()
+            for t in response.css(
+                '#wayfinding-breadcrumbs_feature_div '
+                'ul li:not(.a-breadcrumb-divider) a::text'
+            ).getall()
+            if t.strip()
+        ]
+        if not crumbs:
+            return None
+        return [{'rank': None, 'category': c, 'from_breadcrumb': True} for c in crumbs]
 
     @staticmethod
     def _parse_last_month_sales(response) -> str | None:
