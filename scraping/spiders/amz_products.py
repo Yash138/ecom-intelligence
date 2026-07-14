@@ -49,17 +49,60 @@ import os
 import re
 import uuid
 import json
+import random
 import scrapy
 from scrapy import signals
 from datetime import datetime as dt
 
 try:
     from scrapy_playwright.page import PageMethod
+    from playwright_stealth import Stealth
     _PLAYWRIGHT_AVAILABLE = True
+    _stealth = Stealth()
 except ImportError:
     _PLAYWRIGHT_AVAILABLE = False
+    _stealth = None
+
+
+async def apply_stealth(page, request):
+    await _stealth.apply_stealth_async(page)
 
 from helpers.postgres_handler import PostgresDBHandler
+from helpers.delay_handler import DelayHandler
+
+
+# ---------------------------------------------------------------------------
+# Fingerprint constants (P34)
+# ---------------------------------------------------------------------------
+# The installed Playwright Chromium reports UA "HeadlessChrome/148.0.0.0" — the
+# "Headless" token is an instant bot tell. Overriding the context user_agent
+# removes it AND makes navigator.userAgent match the HTTP header. The engine is
+# Chromium 148, so we claim Chrome/148 to stay consistent with sec-ch-ua.
+#
+# Real headless Chromium advertises only "Chromium" in sec-ch-ua (no "Google
+# Chrome" brand). Overriding sec-ch-ua via extra_http_headers restores the
+# "Google Chrome" brand so client hints match a genuine Chrome install.
+# Verified against httpbin.org/headers — see P34 in scraping/CLAUDE.md.
+_CHROME_UA = (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36'
+)
+_SEC_CH_UA = '"Chromium";v="148", "Google Chrome";v="148", "Not.A/Brand";v="99"'
+_SEC_CH_HEADERS = {
+    'sec-ch-ua': _SEC_CH_UA,
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+}
+# Common desktop viewports — one per context for a little extra entropy.
+# Kept coherent with a Windows desktop; do NOT vary OS/engine (would create
+# navigator.platform / sec-ch-ua-platform mismatches on this Chromium binary).
+_VIEWPORTS = [
+    {'width': 1920, 'height': 1080},
+    {'width': 1536, 'height': 864},
+    {'width': 1440, 'height': 900},
+    {'width': 1366, 'height': 768},
+]
+_N_CONTEXTS = 3   # distinct browser contexts = distinct cookie/session identities
 
 
 class AmzProductsSpider(scrapy.Spider):
@@ -71,7 +114,7 @@ class AmzProductsSpider(scrapy.Spider):
 
     custom_settings = {
         "ITEM_PIPELINES": {},           # spider writes directly to DB
-        "DOWNLOAD_DELAY": 6,
+        "DOWNLOAD_DELAY": 12,
         "RANDOMIZE_DOWNLOAD_DELAY": True,
         "CONCURRENT_REQUESTS": 16,
         "CONCURRENT_REQUESTS_PER_DOMAIN": 16,
@@ -108,6 +151,16 @@ class AmzProductsSpider(scrapy.Spider):
         self.products_written = 0
         self.variants_queued = 0
         self._scraped_asins: list[str] = []
+        self.consecutive_blocked = 0
+        self.total_blocked = 0
+
+        # Fingerprint rotation (P34): N browser contexts, each a distinct
+        # cookie/session identity. Built here, bootstrapped (zip set) in start().
+        self.n_contexts = _N_CONTEXTS if self.use_playwright else 1
+        self._contexts = self._build_contexts()
+        self._contexts_done = 0            # bootstraps completed (ready or failed)
+        self._ready_context_names: list[str] = []
+        self._queue_rows: list[dict] = []  # loaded once in spider_opened
 
     @classmethod
     def from_crawler(cls, crawler, *args, **kwargs):
@@ -132,13 +185,30 @@ class AmzProductsSpider(scrapy.Spider):
                     'headless': False,
                     'args': ['--headless=new', '--disable-gpu'],
                 },
-                'PLAYWRIGHT_MAX_PAGES_PER_CONTEXT': 4,
+                'PLAYWRIGHT_MAX_PAGES_PER_CONTEXT': 2,
                 # Block resources that add no scraping value. Images alone cause
                 # significant memory growth over long runs (P12).
                 'PLAYWRIGHT_ABORT_REQUEST': (
                     lambda req: req.resource_type in ('image', 'media', 'font', 'stylesheet')
                 ),
-                'DOWNLOAD_DELAY':                  6,
+                # P34: hand full header control to the browser. The default
+                # `use_scrapy_headers` injects the Scrapy request's UA/headers
+                # into Playwright's navigation request — which meant
+                # RandomUserAgentMiddleware was sending e.g. "Chrome/59 on Win7"
+                # (and mobile/bot UAs) on a Chromium-148 engine: a glaring
+                # inconsistency. None => browser sends its own coherent headers,
+                # using the per-context user_agent + sec-ch-ua we set.
+                'PLAYWRIGHT_PROCESS_REQUEST_HEADERS': None,
+                # Disable UA randomization + header rotation in Playwright mode —
+                # identity is now owned by the browser context, not middleware.
+                'DOWNLOADER_MIDDLEWARES': {
+                    'scrapy.downloadermiddlewares.useragent.UserAgentMiddleware': None,
+                    'scrapy_user_agents.middlewares.RandomUserAgentMiddleware': None,
+                    'scrapy.downloadermiddlewares.defaultheaders.DefaultHeadersMiddleware': None,
+                    'middlewares.HeaderRotationMiddleware': None,
+                    'scrapy.downloadermiddlewares.cookies.CookiesMiddleware': 700,
+                },
+                'DOWNLOAD_DELAY':                  12,
                 'RANDOMIZE_DOWNLOAD_DELAY':        True,
                 'CONCURRENT_REQUESTS':             4,
                 'CONCURRENT_REQUESTS_PER_DOMAIN':  4,
@@ -147,6 +217,36 @@ class AmzProductsSpider(scrapy.Spider):
         crawler.signals.connect(spider.spider_opened, signal=signals.spider_opened)
         crawler.signals.connect(spider.spider_closed, signal=signals.spider_closed)
         return spider
+
+    # ------------------------------------------------------------------
+    # Context / fingerprint setup (P34)
+    # ------------------------------------------------------------------
+
+    def _build_contexts(self) -> list:
+        """
+        Build N browser-context definitions. Each is a distinct cookie/session
+        identity to Amazon. All share the same engine-consistent Chrome/148
+        Windows UA + sec-ch-ua (varying those would create client-hint/JS
+        mismatches on this single Chromium binary); identity separation comes
+        from the isolated context (own cookies + session-id) and a distinct
+        viewport per context.
+        """
+        contexts = []
+        for i in range(self.n_contexts):
+            contexts.append({
+                'name': f'ctx{i}',
+                'kwargs': {
+                    'user_agent': _CHROME_UA,
+                    'extra_http_headers': dict(_SEC_CH_HEADERS),
+                    'viewport': dict(_VIEWPORTS[i % len(_VIEWPORTS)]),
+                    'locale': 'en-US',
+                    # Timezone matches the (unmasked) India IP, NOT the US delivery
+                    # zip. A US timezone on an Indian IP is a classic proxy/bot
+                    # mismatch signal. Persona: Indian machine, US delivery address.
+                    'timezone_id': 'Asia/Kolkata',
+                },
+            })
+        return contexts
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -163,20 +263,60 @@ class AmzProductsSpider(scrapy.Spider):
             )
         if self.save_html:
             os.makedirs(self._html_archive_dir, exist_ok=True)
+
+        # DelayHandler tracks bad responses and adjusts download slot delay live.
+        # initial_delay matches the Playwright DOWNLOAD_DELAY set in from_crawler.
+        # max_none_counter=3: switch from linear (+1s) to exponential growth after
+        # 3 bad responses within the 5-minute window.
+        self.delay_handler = DelayHandler(
+            initial_delay=12,
+            max_none_counter=3,
+            time_window=300,
+            log=self.log,
+            crawler=self.crawler,
+        )
+
+        # Load the product queue once — sharded/round-robined across contexts
+        # later in _emit_product_requests().
+        self._queue_rows = self._load_queue_rows()
+
         self.log(
             f"DB connected. run_id={self.run_id} "
             f"marketplace_id={self.marketplace_id} "
             f"use_playwright={self.use_playwright} "
             f"limit={self.limit} "
+            f"n_contexts={self.n_contexts} "
+            f"queue_rows={len(self._queue_rows)} "
             f"save_html={self.save_html} "
             f"html_archive_dir={self._html_archive_dir}",
             20,
         )
 
+    def _load_queue_rows(self) -> list:
+        """Read pending ASINs from the queue (ordered, optional limit)."""
+        query = """
+            SELECT marketplace_id, asin, product_url
+            FROM transformed.amz_product_scrape_queue
+            WHERE marketplace_id = %s
+            ORDER BY added_at ASC
+        """
+        params: list = [self.marketplace_id]
+        if self.limit:
+            query += " LIMIT %s"
+            params.append(self.limit)
+        rows = self.db.read(query=query, params=tuple(params))
+        if not rows:
+            self.log(
+                "Queue is empty — nothing to scrape. Run seed_product_queue.sql first.",
+                30,
+            )
+        return rows or []
+
     def spider_closed(self, spider, reason):
         self._write_monitoring_stats()
         self.log(
             f"Spider closed [{reason}]. "
+            f"total_blocked={self.total_blocked} "
             f"products_written={self.products_written} "
             f"variants_queued={self.variants_queued}",
             20,
@@ -189,110 +329,186 @@ class AmzProductsSpider(scrapy.Spider):
 
     async def start(self):
         """
-        If use_playwright=True: yield a bootstrap request to amazon.com that
-        sets the delivery zip to 19901 via the location popover. The zip cookie
-        persists for all subsequent product page requests in the same Playwright
-        context, causing Amazon to serve US-local buybox pricing and seller info.
+        use_playwright=True: yield ONE bootstrap request per browser context.
+        Each bootstrap sets the delivery zip to 19901 via the location popover;
+        the zip cookie persists to all product pages in that context. Product
+        requests are emitted (round-robin across ready contexts) only after all
+        bootstraps resolve — see _context_ready() / _emit_product_requests().
 
-        The actual product queue is loaded and yielded from _load_product_queue()
-        (the bootstrap callback) to guarantee zip is set before any product page
-        is requested.
+        Each context is a distinct cookie/session identity to Amazon (P34), so
+        product load is spread across N identities rather than one.
 
-        If use_playwright=False: load queue directly and yield product requests.
-        JS-rendered fields (price, seller, is_fba) will be NULL in this mode.
+        use_playwright=False: yield product requests directly (static fields only;
+        price/seller/is_fba will be NULL).
         """
-        if self.use_playwright:
+        if not self.use_playwright:
+            for row in self._queue_rows:
+                yield self._product_request(row['asin'], row['product_url'])
+            return
+
+        for ctx in self._contexts:
             yield scrapy.Request(
                 url=self.AMAZON_HOME,
-                callback=self._load_product_queue,
+                callback=self._context_ready,
+                errback=self._bootstrap_error,
+                dont_filter=True,   # N identical URLs — must bypass the dupe filter
                 meta={
                     'playwright': True,
+                    'playwright_context': ctx['name'],
+                    'playwright_context_kwargs': ctx['kwargs'],
+                    'playwright_page_init_callback': apply_stealth,
+                    'ctx_name': ctx['name'],
                     'playwright_page_methods': [
                         PageMethod('wait_for_load_state', 'load'),
-                        PageMethod('wait_for_timeout', 1500),
+                        # Let the homepage settle before clicking — the glow
+                        # ingress block is sometimes not yet interactive at 1.5s,
+                        # which is the main cause of the popover-never-opens
+                        # bootstrap failures (context lost).
+                        PageMethod('wait_for_timeout', 2500),
                         PageMethod('click', '#glow-ingress-block'),
                         # wait_for_selector is more robust than a fixed timeout:
                         # if the popover never opens (slow load, bot block), we get
                         # a clear error immediately rather than a cryptic fill()
                         # timeout 30s later (P23).
                         PageMethod('wait_for_selector', '#GLUXZipUpdateInput',
-                                   state='visible', timeout=15000),
+                                   state='visible', timeout=20000),
                         PageMethod('fill', '#GLUXZipUpdateInput', self.ZIP_CODE),
                         PageMethod('wait_for_timeout', 500),
                         PageMethod('click', 'span#GLUXZipUpdate input.a-button-input'),
                         PageMethod('wait_for_timeout', 2500),
                     ],
                 },
-                errback=self.handle_error,
             )
+
+    def _context_ready(self, response):
+        """Bootstrap callback — one per context. Zip is now set for this context."""
+        name = response.meta['ctx_name']
+        # Use _is_captcha (NOT _is_blocked) — the homepage has no #productTitle,
+        # which would false-positive the null-title branch of _is_blocked.
+        if self._is_captcha(response):
+            self.log(f"Bootstrap BLOCKED for context {name} — excluding it.", 40)
         else:
-            for req in self._build_product_requests():
-                yield req
+            self._ready_context_names.append(name)
+            self.log(f"Context {name} ready (zip {self.ZIP_CODE} set).", 20)
+        self._contexts_done += 1
+        if self._contexts_done >= self.n_contexts:
+            yield from self._emit_product_requests()
 
-    def _load_product_queue(self, response):
-        """
-        Called after bootstrap sets the zip code.
-        Loads the product queue from DB and yields one Request per ASIN.
-        """
-        self.log(f"Zip set to {self.ZIP_CODE}. Loading product queue...", 20)
-        for req in self._build_product_requests():
-            yield req
+    def _bootstrap_error(self, failure):
+        """Bootstrap errback — count it done so remaining contexts can proceed."""
+        name = failure.request.meta.get('ctx_name', '?')
+        self.log(f"Bootstrap failed for context {name}: {failure.value}", 40)
+        self._contexts_done += 1
+        if self._contexts_done >= self.n_contexts:
+            yield from self._emit_product_requests()
 
-    def _build_product_requests(self) -> list:
-        """Load pending ASINs from queue, return list of scrapy.Request objects."""
-        query = """
-            SELECT marketplace_id, asin, product_url
-            FROM transformed.amz_product_scrape_queue
-            WHERE marketplace_id = %s
-            ORDER BY added_at ASC
-        """
-        params: list = [self.marketplace_id]
-
-        if self.limit:
-            query += " LIMIT %s"
-            params.append(self.limit)
-
-        rows = self.db.read(query=query, params=tuple(params))
-
-        if not rows:
+    def _emit_product_requests(self):
+        """Emit all queued product requests, round-robin across ready contexts."""
+        ready = self._ready_context_names
+        if not ready:
             self.log(
-                "Queue is empty — nothing to scrape. "
-                "Run seed_product_queue.sql first.",
-                30,
+                "No contexts became ready (all bootstraps blocked/failed). "
+                "Nothing to scrape — try again later in the IST window.",
+                40,
             )
-            return []
-
+            return
         self.log(
-            f"Loaded {len(rows)} ASINs from queue "
-            f"(marketplace={self.marketplace_id}, limit={self.limit}).",
+            f"{len(ready)}/{self.n_contexts} context(s) ready: {ready}. "
+            f"Emitting {len(self._queue_rows)} product requests round-robin.",
             20,
         )
+        for idx, row in enumerate(self._queue_rows):
+            ctx = ready[idx % len(ready)]
+            yield self._product_request(row['asin'], row['product_url'], ctx=ctx)
 
-        requests = []
-        for row in rows:
-            meta: dict = {
-                'asin':        row['asin'],
-                'product_url': row['product_url'],
-            }
-            if self.use_playwright:
-                meta['playwright'] = True
-                meta['playwright_page_methods'] = [
-                    # wait_for_load_state('load') covers initial HTML + blocking scripts.
-                    # Fixed 3s wait for the buybox AJAX (price/seller) to settle.
-                    # networkidle is NOT used — Amazon fires continuous analytics XHR
-                    # that prevent it from ever firing (P22).
-                    PageMethod('wait_for_load_state', 'load'),
-                    PageMethod('wait_for_timeout', 3000),
-                ]
-            requests.append(
-                scrapy.Request(
-                    url=row['product_url'],
-                    callback=self.parse_product,
-                    meta=meta,
-                    errback=self.handle_error,
-                )
+    def _product_request(self, asin, product_url, ctx=None, sparse_retry=0):
+        """Build one product-page Request (Playwright bound to `ctx` if given)."""
+        meta: dict = {'asin': asin, 'product_url': product_url}
+        if sparse_retry:
+            meta['sparse_retry'] = sparse_retry
+        if self.use_playwright:
+            meta['playwright'] = True
+            meta['playwright_page_init_callback'] = apply_stealth
+            # wait_for_load_state('load') covers initial HTML + blocking scripts.
+            # Randomized dwell (2.5–4.5s) lets the buybox AJAX (price/seller)
+            # settle and mimics human variance rather than a fixed cadence.
+            # networkidle is NOT used — Amazon fires continuous analytics XHR
+            # that prevent it from ever firing (P22).
+            meta['playwright_page_methods'] = [
+                PageMethod('wait_for_load_state', 'load'),
+                PageMethod('wait_for_timeout', random.randint(2500, 4500)),
+            ]
+            if ctx:
+                meta['playwright_context'] = ctx
+        return scrapy.Request(
+            url=product_url,
+            callback=self.parse_product,
+            meta=meta,
+            errback=self.handle_error,
+            dont_filter=bool(sparse_retry),
+        )
+
+    @staticmethod
+    def _is_captcha(response) -> bool:
+        """
+        Hard CAPTCHA / bot-block signals — valid on ANY Amazon page (incl. the
+        homepage bootstrap, which has no product title).
+
+          1. URL redirect to /errors/validateCaptcha
+          2. CAPTCHA JS instrumentation script in body
+          3. Auth-challenge API call in body (newer CAPTCHA flow)
+          4. Bot-block landing page text
+        """
+        url = response.url
+        text = response.text
+        if '/errors/validateCaptcha' in url:
+            return True
+        if 'csm-captcha-instrumentation.min.js' in text:
+            return True
+        if 'api.auth-challenge.amazon.com' in text:
+            return True
+        if 'To discuss automated access to Amazon data' in text:
+            return True
+        return False
+
+    @classmethod
+    def _is_blocked(cls, response) -> bool:
+        """
+        Product-page block check: the hard CAPTCHA signals PLUS a null-title
+        fallback (a rendered product page with no #productTitle is almost
+        certainly a block, not a real listing). Do NOT use this for the homepage
+        bootstrap — the homepage has no product title and would false-positive.
+        """
+        if cls._is_captcha(response):
+            return True
+        title_sel = response.css('#productTitle::text').get()
+        if not title_sel or not title_sel.strip():
+            return True
+        return False
+
+    def _handle_blocked(self, asin: str, response) -> None:
+        """
+        Called when _is_blocked() returns True.
+        Increments backoff via DelayHandler, tracks consecutive count,
+        and closes the spider after 10 consecutive blocks.
+        ASIN is NOT deleted from queue — stays for retry on next run.
+        """
+        self.total_blocked += 1
+        self.consecutive_blocked += 1
+        self.delay_handler.handle_none_response([], None, response)
+        self.log(
+            f"  BLOCKED asin={asin} — consecutive={self.consecutive_blocked}/10 "
+            f"total_blocked={self.total_blocked} current_delay={self.delay_handler.delay}s",
+            30,
+        )
+        if self.consecutive_blocked >= 10:
+            self.log(
+                "10 consecutive blocked responses from Amazon — "
+                "exponential backoff exhausted. Closing spider. "
+                "Queue is intact; resume on next run within the 11AM–11PM IST window.",
+                40,
             )
-        return requests
+            self.crawler.engine.close_spider(self, 'blocked_by_amazon')
 
     def parse_product(self, response):
         """
@@ -304,6 +520,13 @@ class AmzProductsSpider(scrapy.Spider):
         sparse_retry = response.meta.get('sparse_retry', 0)
 
         self.log(f"Parsing product asin={asin} url={response.url}", 20)
+
+        # Block detection — must run before any extraction attempt.
+        # CAPTCHA / bot-block pages return garbage HTML; extraction would
+        # produce null fields and write corrupt rows to staging.
+        if self._is_blocked(response):
+            self._handle_blocked(asin, response)
+            return
 
         data = self._extract_product(response, asin)
 
@@ -325,23 +548,12 @@ class AmzProductsSpider(scrapy.Spider):
                 f"— retrying once with fresh request.",
                 30,
             )
-            retry_meta: dict = {
-                'asin':         asin,
-                'product_url':  response.meta['product_url'],
-                'sparse_retry': 1,
-            }
-            if self.use_playwright:
-                retry_meta['playwright'] = True
-                retry_meta['playwright_page_methods'] = [
-                    PageMethod('wait_for_load_state', 'load'),
-                    PageMethod('wait_for_timeout', 3000),
-                ]
-            yield scrapy.Request(
-                url=response.meta['product_url'],
-                callback=self.parse_product,
-                meta=retry_meta,
-                errback=self.handle_error,
-                dont_filter=True,
+            # Reuse the SAME context so the zip 19901 cookie is still in effect.
+            yield self._product_request(
+                asin,
+                response.meta['product_url'],
+                ctx=response.meta.get('playwright_context'),
+                sparse_retry=1,
             )
             return
 
@@ -389,6 +601,9 @@ class AmzProductsSpider(scrapy.Spider):
 
         self.products_written += 1
         self._scraped_asins.append(asin)
+        # Successful write — reset consecutive block counter and decay delay.
+        self.consecutive_blocked = 0
+        self.delay_handler.handle_successful_response(response)
 
         self.log(
             f"  asin={asin} written. "
@@ -464,7 +679,11 @@ class AmzProductsSpider(scrapy.Spider):
             return m.group(1).strip()
         if text.startswith('Brand: '):
             return text[7:].strip()
-        if text:
+        # Books/media: bylineInfo first text node is "by"; author name is in .author a
+        author = (response.css('#bylineInfo .author a::text').get() or '').strip()
+        if author:
+            return author
+        if text and text.lower() not in ('by', ''):
             return text
         # Fallback: "Brand Name" row in product detail table
         for th_el in response.css('th.prodDetSectionEntry'):
@@ -766,14 +985,31 @@ class AmzProductsSpider(scrapy.Spider):
     @staticmethod
     def _parse_seller_name(response) -> str | None:
         """
-        Two seller display patterns:
-          - Third-party sellers: #sellerProfileTriggerId (link with seller profile)
-          - Amazon-sold products: #merchant-info "Sold by <name> and Fulfilled by Amazon"
+        Seller display patterns (Amazon layout has changed over time):
+          1. Third-party sellers: #sellerProfileTriggerId link text
+          2. New tabular buybox: <span>Sold by:</span><span>Name</span> pair
+          3. Compact combined: "Ships from and sold by Name." or "Sold by Name and ships from..."
+          4. Legacy: #merchant-info free-text
         """
         name = (response.css('#sellerProfileTriggerId::text').get() or '').strip()
         if name:
             return name
-        # Fallback: #merchant-info — first <a> text after "Sold by"
+        # New tabular buybox: <span>Sold by:</span><span>Seller Name</span>
+        sold_by = response.xpath(
+            '//span[normalize-space(text())="Sold by:"]/following-sibling::span[1]/text()'
+        ).get()
+        if sold_by:
+            sold_by = sold_by.strip()
+            if sold_by:
+                return sold_by
+        # Compact combined text: "Ships from and sold by Name." or "Sold by Name and ships from..."
+        # Note: seller names can contain dots (e.g. "Amazon.com") so use .+? not [^.]+?
+        for t in response.css('span.a-color-secondary::text, span.a-size-small.a-color-secondary::text').getall():
+            t = t.strip()
+            m = re.search(r'[Ss]old by (.+?)(?:\s+and\s+ships from|\.\s*$)', t)
+            if m:
+                return m.group(1).strip()
+        # Legacy fallback: #merchant-info free-text (older page layouts)
         merchant_texts = response.css('#merchant-info ::text').getall()
         in_sold_by = False
         for t in merchant_texts:
@@ -798,19 +1034,32 @@ class AmzProductsSpider(scrapy.Spider):
     def _parse_is_fba(response) -> bool | None:
         """
         Returns True if Amazon fulfills, False if seller fulfills, None if no
-        buybox info rendered (may mean out of stock or blocked page).
+        buybox info rendered (out of stock or blocked page).
 
-        Two detection patterns:
-          - #sellerProfileTriggerId href contains isAmazonFulfilled=1 (third-party FBA)
-          - #merchant-info text contains "Fulfilled by Amazon" (Amazon-sold/FBA)
+        Detection patterns (Amazon layout has changed over time):
+          1. #sellerProfileTriggerId href: isAmazonFulfilled=1 (third-party FBA)
+          2. New tabular buybox: "Ships from:" label + adjacent span — "Amazon" means FBA
+          3. Compact combined: "Ships from and sold by Amazon" / "ships from Amazon Fulfillment"
+          4. Legacy: #merchant-info text "Fulfilled by Amazon"
         """
         href = response.css('#sellerProfileTriggerId::attr(href)').get()
         if href is not None:
             return bool(re.search(r'isAmazonFulfilled=1', href))
-        # Fallback: merchant-info for Amazon-sold products
+        # New tabular buybox: <span>Ships from:</span><span>Amazon.com</span>
+        ships_from = response.xpath(
+            '//span[normalize-space(text())="Ships from:"]/following-sibling::span[1]/text()'
+        ).get()
+        if ships_from:
+            return 'amazon' in ships_from.lower()
+        # Compact combined text
+        for t in response.css('span.a-color-secondary::text, span.a-size-small.a-color-secondary::text').getall():
+            t_lower = t.lower()
+            if 'ships from' in t_lower or 'fulfilled by' in t_lower:
+                return 'amazon' in t_lower
+        # Legacy fallback: #merchant-info free-text (older page layouts)
         merchant_text = ' '.join(response.css('#merchant-info ::text').getall())
         if merchant_text.strip():
-            return 'Fulfilled by Amazon' in merchant_text
+            return 'Fulfilled by Amazon' in merchant_text or 'Ships from and sold by Amazon' in merchant_text
         return None
 
     # ------------------------------------------------------------------

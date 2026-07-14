@@ -25,7 +25,6 @@ $allCategories = @(
     "Handmade Products",
     "Health & Household",
     "Home & Kitchen",
-    "Kitchen & Dining",
     "Office Products",
     "Patio, Lawn & Garden",
     "Pet Supplies",
@@ -40,7 +39,7 @@ function Run-Category([string]$cat, [string]$listType) {
     Write-Host "Category : $cat"
     Write-Host "Log      : $logFile"
     Write-Host "========================================"
-    scrapy crawl AmzRankings -a list_type=$listType -a "categories=$cat" -a include_descendants=true -s LOG_FILE=$logFile
+    & "D:\Documents\projects\GitHub\ecom-intelligence\.venv_scrape\Scripts\scrapy.exe" crawl AmzRankings -a list_type=$listType -a "categories=$cat" -a include_descendants=true -s LOG_FILE=$logFile
 }
 
 # Single-category mode

@@ -50,24 +50,37 @@ scrapy crawl AmzCategoryHierarchy -a marketplace_id=amazon_us \
   -s LOG_FILE=logs/amz_category_hierarchy.log
 ```
 
-### Run (single category only — for targeted re-runs / gap fills)
+### Run (subset of categories)
 
-Temporarily edit `../docs/chosen_categories.csv` to contain only the target
-category, run the spider, then restore the file.
+Use `-a target_categories=` with pipe-delimited names. Do not use commas — category
+names contain commas and would be split incorrectly.
 
 ```bash
-# Example: fix orphaned nodes in Tools & Home Improvement only
-# 1. Edit chosen_categories.csv → one line: Tools & Home Improvement
+# Single category
 scrapy crawl AmzCategoryHierarchy -a marketplace_id=amazon_us \
-  -s LOG_FILE=logs/amz_category_hierarchy_fix.log
-# 2. Restore chosen_categories.csv
+  -a "target_categories=Home & Kitchen" \
+  -s LOG_FILE=logs/amz_category_hierarchy_hk.log
+
+# Multiple categories
+scrapy crawl AmzCategoryHierarchy -a marketplace_id=amazon_us \
+  -a "target_categories=Pet Supplies|Office Products" \
+  -s LOG_FILE=logs/amz_category_hierarchy_subset.log
+
+# Category names with commas — pipe delimiter handles them correctly
+scrapy crawl AmzCategoryHierarchy -a marketplace_id=amazon_us \
+  -a "target_categories=Arts, Crafts & Sewing|Clothing, Shoes & Jewelry" \
+  -s LOG_FILE=logs/amz_category_hierarchy_subset.log
 ```
+
+Omit `target_categories` entirely to run all categories in `chosen_categories.csv`.
 
 ### Parameters
 
 | Parameter | Default | Description |
 |---|---|---|
 | `marketplace_id` | `amazon_us` | Target marketplace. Must exist in `transformed.marketplaces`. |
+| `target_categories` | *(all from chosen_categories.csv)* | **Pipe-delimited** (`\|`) category names to restrict the run. E.g. `"Home & Kitchen"` or `"Pet Supplies\|Office Products"`. Must match root category names exactly. Do NOT use commas — category names contain commas. |
+| `use_playwright` | `true` | `true` — zip 19901 bootstrap sets US geo before nav traversal (required for correct US category tree from non-US IPs). `false` — plain HTTP, no geo fix, may produce wrong hierarchy from non-US IP. |
 
 ### Post-run (first time only)
 
@@ -130,10 +143,10 @@ For subcategory targeting, use the direct scrapy commands below.
 #### Sequential — all categories
 
 ```powershell
-# All 10 categories, bestseller (default)
+# All 9 categories, bestseller (default)
 .\run_rankings.ps1
 
-# All 10 categories, new releases
+# All 9 categories, new releases
 .\run_rankings.ps1 -ListType new_release
 ```
 
@@ -478,20 +491,21 @@ WHERE asin = 'B0BZYCJK89';
 
 ## Run order (Phase 0)
 
+**Current path (bestseller only):** new_release rankings are deferred — will be added in a future run
+once the bestseller product scrape is complete and validated.
+
 ```
 1. AmzCategoryHierarchy              (once per market)
 2. validate_hierarchy.sql            (MUST pass — all 6 checks must return 0 rows)
 3. seed_controller.sql               (once, after hierarchy spider)
 4. AmzRankings  list_type=bestseller
 5. merge_rankings.sql
-6. AmzRankings  list_type=new_release
-7. merge_rankings.sql
-8. seed_product_queue.sql            (after both rankings merge cycles)
-9. AmzProducts                       (reads queue, writes amz_product_snapshot)
-10. validate_product_run.sql         (MUST pass — all checks return 0 rows)
+6. seed_product_queue.sql            (after bestseller merge)
+7. AmzProducts                       (reads queue, writes amz_product_snapshot)
+8. validate_product_run.sql          (MUST pass — all checks return 0 rows)
 ```
 
-Full sequence as copy-paste commands (run from `scraping/` in PowerShell):
+**Full sequence (bestseller path) — copy-paste commands (run from `scraping/` in PowerShell):**
 
 ```powershell
 # 1. Category hierarchy
@@ -508,27 +522,35 @@ psql -d ecom_intel -U ecom_intel_admin -f db/seed_controller.sql
 .\run_rankings.ps1
 psql -d ecom_intel -U ecom_intel_admin -f db/merge_rankings.sql
 
-# 6+7. New release rankings + merge
-.\run_rankings.ps1 -ListType new_release
-psql -d ecom_intel -U ecom_intel_admin -f db/merge_rankings.sql
-
-# 8. Seed product queue
+# 6. Seed product queue
 psql -d ecom_intel -U ecom_intel_admin -f db/seed_product_queue.sql
 
-# 9. Scrape product pages
+# 7. Scrape product pages
 scrapy crawl AmzProducts -a marketplace_id=amazon_us `
   -s LOG_FILE=logs/amz_products.log
 
-# 10. Validate product run
+# 8. Validate product run
 psql -d ecom_intel -U ecom_intel_admin -f db/validate_product_run.sql
+```
+
+**Future — when new_release rankings are needed:**
+
+```powershell
+# Run after the bestseller product scrape is complete and validated.
+# Truncate staging before the new_release run to avoid reprocessing bestseller rows in merge.
+.\run_rankings.ps1 -ListType new_release
+psql -d ecom_intel -U ecom_intel_admin -f db/merge_rankings.sql
+# Re-seed queue and re-run AmzProducts to pick up new ASINs from new_release rankings
+psql -d ecom_intel -U ecom_intel_admin -f db/seed_product_queue.sql
+scrapy crawl AmzProducts -a marketplace_id=amazon_us -s LOG_FILE=logs/amz_products_nr.log
 ```
 
 ### validate_hierarchy.sql — checks and what they catch
 
 | Check | What it catches |
 |---|---|
-| 1 — Root node count = 10 | Spider missed target categories on root page |
-| 2 — All 10 categories present | Same as above, but names the missing ones |
+| 1 — Root node count = 9 | Spider missed target categories on root page |
+| 2 — All 9 categories present | Same as above, but names the missing ones |
 | 3 — No shared root node_ids | Multiple root categories overwriting each other (shared URL slug bug) |
 | 4 — No node under multiple roots | Closure table cross-contamination — node attributed to wrong category |
 | 5 — Every node reachable from a root | Orphaned nodes that seed_controller would skip entirely |

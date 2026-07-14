@@ -23,6 +23,7 @@ class DelayHandler:
         return current_time, len(self.none_response_timestamps)
 
     def _adjust_delay(self, new_delay, request=None):
+        old_delay = self.delay
         self.delay = new_delay
         slot_key = None
         if request and 'download_slot' in request.meta:
@@ -32,7 +33,8 @@ class DelayHandler:
         slots = self.crawler.engine.downloader.slots
         if slot_key in slots:
             slots[slot_key].delay = self.delay
-            self.log(f"Delay adjusted to {self.delay}s on slot '{slot_key}'", level=30)
+            if new_delay != old_delay:
+                self.log(f"Delay adjusted {old_delay}s → {self.delay}s on slot '{slot_key}'", level=30)
         else:
             self.log(f"Slot '{slot_key}' not found. Available: {list(slots.keys())}", level=40)
 

@@ -12,19 +12,20 @@
 \echo '=============================='
 
 -- ------------------------------------------------------------------
--- CHECK 1: Exactly 10 root nodes (depth=0), one per target category.
--- Expected: count = 10
+-- CHECK 1: Exactly 9 root nodes (depth=0), one per target category.
+-- Expected: count = 9
 -- Failure: the spider missed some target categories (no match on root page)
 --          or TARGET_CATEGORIES config is wrong.
+-- Note: chosen_categories.csv has 9 categories — Kitchen & Dining is NOT included.
 -- ------------------------------------------------------------------
 \echo ''
-\echo 'CHECK 1 — Root node count (expect 10):'
+\echo 'CHECK 1 — Root node count (expect 9):'
 SELECT COUNT(*) AS root_count
 FROM transformed.amz_category
 WHERE marketplace_id = 'amazon_us' AND depth = 0;
 
 -- ------------------------------------------------------------------
--- CHECK 2: All 10 expected categories are present at depth=0.
+-- CHECK 2: All 9 expected categories are present at depth=0.
 -- Expected: 0 rows returned (no missing categories).
 -- Failure: the spider did not find one or more target categories on the
 --          Amazon root page. The missing category has no hierarchy data.
@@ -38,7 +39,6 @@ FROM (VALUES
     ('Handmade Products'),
     ('Health & Household'),
     ('Home & Kitchen'),
-    ('Kitchen & Dining'),
     ('Office Products'),
     ('Patio, Lawn & Garden'),
     ('Pet Supplies'),
