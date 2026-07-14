@@ -40,11 +40,18 @@ from datetime import datetime as dt
 
 try:
     from scrapy_playwright.page import PageMethod
+    from playwright_stealth import Stealth
     _PLAYWRIGHT_AVAILABLE = True
+    _stealth = Stealth()
 except ImportError:
     _PLAYWRIGHT_AVAILABLE = False
+    _stealth = None
 
 from helpers.postgres_handler import PostgresDBHandler
+
+
+async def apply_stealth(page, request):
+    await _stealth.apply_stealth_async(page)
 
 
 class AmzRankingsSpider(scrapy.Spider):
@@ -57,7 +64,7 @@ class AmzRankingsSpider(scrapy.Spider):
     # DOWNLOAD_HANDLERS + PLAYWRIGHT_* settings.
     custom_settings = {
         "ITEM_PIPELINES": {},           # spider writes directly to DB — no pipeline needed
-        "DOWNLOAD_DELAY": 8,
+        "DOWNLOAD_DELAY": 12,
         "RANDOMIZE_DOWNLOAD_DELAY": True,
         "CONCURRENT_REQUESTS": 16,
         "CONCURRENT_REQUESTS_PER_DOMAIN": 16,
@@ -162,7 +169,7 @@ class AmzRankingsSpider(scrapy.Spider):
                 'PLAYWRIGHT_ABORT_REQUEST': (
                     lambda req: req.resource_type in ('image', 'media', 'font', 'stylesheet')
                 ),
-                'DOWNLOAD_DELAY':                   8,
+                'DOWNLOAD_DELAY':                   12,
                 'RANDOMIZE_DOWNLOAD_DELAY':         True,
                 'CONCURRENT_REQUESTS':              4,
                 'CONCURRENT_REQUESTS_PER_DOMAIN':   4,
@@ -441,24 +448,37 @@ class AmzRankingsSpider(scrapy.Spider):
           1. wait_for_load_state('domcontentloaded') — always resolves immediately,
              whether or not product cards are present. Replaced wait_for_selector
              which timed out on empty-category pages (P18).
-          2. evaluate (scroll) — triggers the ACP widget's scroll event listener,
-             which fires the lazy-load XHR for items 31-50.
-          3. wait_for_timeout — 1.5 seconds for the XHR to respond and the DOM to
-             update with the remaining cards before Scrapy reads the HTML.
+          2. evaluate (iterative scroll) — Amazon uses IntersectionObserver, not a
+             scroll event. window.scrollTo(bottom) does NOT trigger the lazy-load.
+             Instead, scrolling the last visible card into the viewport fires the
+             observer and loads the next batch (~8 cards). We repeat up to 5 times
+             with 2s waits until we reach 50 cards or the count stops growing (P25).
+             Typical path: 30 → 38 → 46 → 50 (3 iterations, ~6s).
 
         The resulting response.text contains all 50 product cards — no separate
         XHR request needed. _extract_products() selectors work unchanged.
         """
         return {
             'playwright': True,
+            'playwright_page_init_callback': apply_stealth,
             'playwright_page_methods': [
                 # wait_for_load_state instead of wait_for_selector so we don't time out
                 # on empty-category pages ("Sorry, there are no Best Sellers available").
-                # The initial 30 products are in the DOM by domcontentloaded; scroll below
-                # triggers ACP lazy-load for items 31-50 on non-empty pages.
+                # The initial 30 products are in the DOM by domcontentloaded; the IIFE
+                # below then scrolls iteratively to trigger IntersectionObserver batches.
                 PageMethod('wait_for_load_state', 'domcontentloaded'),
-                PageMethod('evaluate', 'window.scrollTo(0, document.body.scrollHeight)'),
-                PageMethod('wait_for_timeout', 1500),   # ms — wait for lazy-load XHR
+                PageMethod('evaluate', """(async () => {
+                    const sel = 'div[data-asin]';
+                    for (let i = 0; i < 5; i++) {
+                        const cards = document.querySelectorAll(sel);
+                        if (cards.length >= 50) break;
+                        const prev = cards.length;
+                        if (cards.length > 0)
+                            cards[cards.length - 1].scrollIntoView({behavior: 'instant', block: 'end'});
+                        await new Promise(r => setTimeout(r, 2000));
+                        if (document.querySelectorAll(sel).length === prev) break;
+                    }
+                })()"""),
             ],
         }
 

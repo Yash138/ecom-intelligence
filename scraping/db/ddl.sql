@@ -95,6 +95,12 @@ CREATE TABLE IF NOT EXISTS staging.amz_ranking_snapshot (
     PRIMARY KEY (id)
 );
 
+-- Unique constraint required for ON CONFLICT in bulk_upsert during spider writes.
+-- Dedup key within a single run: same ASIN cannot rank twice in the same node+run.
+ALTER TABLE staging.amz_ranking_snapshot
+    ADD CONSTRAINT amz_ranking_snapshot_run_asin_uq
+    UNIQUE (run_id, marketplace_id, list_type, subcategory_node_id, asin);
+
 CREATE INDEX IF NOT EXISTS idx_ranking_snapshot_lookup
     ON staging.amz_ranking_snapshot (marketplace_id, list_type, scraped_at);
 
@@ -129,7 +135,67 @@ CREATE INDEX IF NOT EXISTS idx_ranking_by_date
 CREATE INDEX IF NOT EXISTS idx_ranking_by_asin
     ON transformed.amz_ranking (asin, marketplace_id, scrape_date);
 
--- 8. Product snapshot — output of AmzProducts spider (schema TBD, deferred)
+-- 8a. Product scrape queue — to-do list for AmzProducts spider
+--     Seeded from transformed.amz_ranking via seed_product_queue.sql.
+--     Delete-on-success: row is removed after a successful scrape + DB write.
+--     No scrape_status column — job is either pending (in queue) or done (deleted).
+--     Variant ASINs discovered during scraping are also inserted here (ON CONFLICT DO NOTHING).
+CREATE TABLE IF NOT EXISTS transformed.amz_product_scrape_queue (
+    marketplace_id   VARCHAR(20)  NOT NULL REFERENCES transformed.marketplaces(marketplace_id),
+    asin             VARCHAR(20)  NOT NULL,
+    product_url      TEXT         NOT NULL,
+    added_at         TIMESTAMP    NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (marketplace_id, asin)
+);
+
+-- 8b. Product snapshot — output of AmzProducts spider
+--     One row per (marketplace_id, asin). UPSERT semantics on re-scrape.
+--     first_captured_at: set on INSERT only, never updated (SCD2 foundation).
+--     last_captured_at: updated on every re-scrape.
+--     JS-rendered fields (price, seller_name, seller_id, is_fba) require
+--     Playwright with zip code 19901 set; NULL when scraped without Playwright.
+CREATE TABLE IF NOT EXISTS staging.amz_product_snapshot (
+    -- identity
+    marketplace_id      VARCHAR(20)  NOT NULL REFERENCES transformed.marketplaces(marketplace_id),
+    asin                VARCHAR(20)  NOT NULL,
+    -- SCD2 timestamps
+    first_captured_at   TIMESTAMP    NOT NULL DEFAULT NOW(),
+    last_captured_at    TIMESTAMP    NOT NULL DEFAULT NOW(),
+    -- static fields (rarely change)
+    title               TEXT,
+    brand               VARCHAR(255),
+    main_image_url      TEXT,
+    launch_date         VARCHAR(50),        -- raw text, e.g. "January 1, 2023"
+    about_this_item     TEXT,               -- newline-delimited bullet points
+    -- volatile fields (change frequently)
+    rating              NUMERIC(3,2),
+    review_count        INTEGER,
+    rating_breakdown    JSONB,              -- {"5":63,"4":12,"3":7,"2":6,"1":12}
+    bsr_entries         JSONB,              -- [{"rank":360,"category":"Patio, Lawn & Garden"},...]
+    last_month_sales    VARCHAR(30),        -- raw text, e.g. "100+" or "1K+"
+    -- JS-rendered fields (Playwright + zip 19901 required)
+    price               NUMERIC(10,2),
+    seller_name         VARCHAR(255),
+    seller_id           VARCHAR(50),
+    is_fba              BOOLEAN,
+    -- variant and related products
+    has_variants        BOOLEAN,
+    variant_asins       JSONB,              -- ["B0XX","B0YY"]
+    related_asins       JSONB,              -- ["B0AA","B0BB"]
+    -- product attributes (sparse — not present on all products)
+    weight              VARCHAR(100),
+    dimensions          VARCHAR(200),
+    -- metadata
+    is_small_business   BOOLEAN,
+    html_file_path      VARCHAR(500),       -- path to archived rendered HTML; NULL if not saved
+    PRIMARY KEY (marketplace_id, asin)
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_snapshot_by_marketplace
+    ON staging.amz_product_snapshot (marketplace_id, last_captured_at);
+
+CREATE INDEX IF NOT EXISTS idx_product_snapshot_by_asin
+    ON staging.amz_product_snapshot (asin);
 
 -- 9. Monitoring — null rate tracking per run per field
 CREATE TABLE IF NOT EXISTS monitoring.scrape_run_field_stats (
